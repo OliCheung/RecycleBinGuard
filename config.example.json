@@ -1,0 +1,13 @@
+{
+  "threshold_items": 10000,
+  "poll_interval_seconds": 180,
+  "auto_clean_enabled": false,
+  "auto_clean_confirmed": false,
+  "dry_run": true,
+  "confirm_before_clean": true,
+  "confirmation_timeout_seconds": 10,
+  "failure_backoff_seconds": 300,
+  "start_on_login": false,
+  "log_max_bytes": 1048576,
+  "log_backup_count": 5
+}

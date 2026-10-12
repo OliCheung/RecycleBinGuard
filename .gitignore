@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# PyInstaller
+*.spec.bak
+packaging/recyclebingguard.ico
+
+# 本地运行时数据（正常位于 %LOCALAPPDATA%，此处兜底）
+*.log
+local_data/
+
+# 代理/工具内存（含个人上下文，勿入库）
+.workbuddy/
+
+# 运行时临时文件（原子写产生的 .tmp）
+*.tmp
+
+# 加密 / 编译产物（dist/ 已整体忽略，此处兜底）
+*.enc
+*.pyd
+
+# 真实运行时配置（仅提交 config.example.json）
+config.json
+
+# 散落二进制（dist/、build/ 已忽略，此处兜底）
+*.exe
+*.pyz
+*.zip
+
+# 编辑器 / 操作系统杂项
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

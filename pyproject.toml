@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recyclebingguard"
+version = "0.1.0"
+description = "Windows 10 回收站后台监控与自动清理工具"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "pystray==0.19.5",
+    "Pillow==10.4.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.3"]
+
+[project.gui-scripts]
+recyclebingguard = "recyclebingguard.__main__:main"
+
+[tool.setuptools]
+packages = ["recyclebingguard"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra"

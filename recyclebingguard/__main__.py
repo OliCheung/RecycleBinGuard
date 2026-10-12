@@ -1,0 +1,362 @@
+"""程序入口。
+
+职责：解析命令行、加载配置、初始化日志、保证单实例、启动托盘应用。
+重量级依赖（pystray / tkinter）只在真正需要界面时才导入，便于
+``--check-once`` 这类诊断命令在无 GUI 场景下运行。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import sys
+import traceback
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Iterator
+
+from . import APP_NAME, __version__, paths
+from .config import ConfigError, load_config, save_config
+from .logging_setup import setup_logging
+from .single_instance import SingleInstance, request_wake
+
+EXIT_OK = 0
+EXIT_CONFIG_ERROR = 2
+EXIT_ALREADY_RUNNING = 3
+EXIT_UNSUPPORTED = 4
+
+#: CLI 文本输出去向（默认直接打印到标准输出）。
+Emit = Callable[[str], None]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Windows 10 回收站后台监控与自动清理工具",
+    )
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
+    parser.add_argument(
+        "--init-config",
+        action="store_true",
+        help="在当前用户数据目录写入一份默认（安全）配置后退出",
+    )
+    parser.add_argument(
+        "--check-once",
+        action="store_true",
+        help="只做一次统计后退出（不启动托盘，也不清空任何东西）",
+    )
+    parser.add_argument(
+        "--console-log",
+        action="store_true",
+        help="同时把日志输出到标准错误（调试用）",
+    )
+    parser.add_argument(
+        "--autostart",
+        choices=["on", "off", "status"],
+        help="设置 / 查询当前用户开机启动项后退出",
+    )
+    parser.add_argument(
+        "--start-minimized",
+        action="store_true",
+        help="只驻留托盘，不弹出状态窗口（开机自启时使用）",
+    )
+    parser.add_argument(
+        "--install-shortcuts",
+        action="store_true",
+        help="创建开始菜单与桌面快捷方式（当前用户范围）",
+    )
+    parser.add_argument(
+        "--remove-shortcuts",
+        action="store_true",
+        help="删除本程序创建的快捷方式",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="移除开机启动项与快捷方式（默认保留配置与日志）",
+    )
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="配合 --uninstall：同时删除配置与日志目录",
+    )
+    parser.add_argument(
+        "--report",
+        metavar="PATH",
+        help=(
+            "把命令行输出同时追加写入指定文件"
+            "（打包成无控制台的 GUI 程序时用于排查，例如 --check-once --report out.txt）"
+        ),
+    )
+    return parser
+
+
+@contextmanager
+def _open_report(path: str | None) -> Iterator[Emit | None]:
+    """打开 ``--report`` 指定的文件，返回写入函数；未指定时返回 ``None``。"""
+    if not path:
+        yield None
+        return
+
+    target = Path(path)
+    if target.parent and not target.parent.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    handle = target.open("a", encoding="utf-8")
+    try:
+        def write(text: str = "") -> None:
+            handle.write(f"{text}\n")
+            handle.flush()
+
+        yield write
+    finally:
+        handle.close()
+
+
+def _make_emit(report: Emit | None) -> Emit:
+    """构造 CLI 输出函数：始终打印到标准输出（可能是 os.devnull），可选再写文件。"""
+    if report is None:
+        return print
+
+    def emit(text: str = "") -> None:
+        print(text)
+        report(text)
+
+    return emit
+
+
+def _warn_already_running() -> None:
+    """提示已有实例：优先弹窗，失败则退回控制台输出。"""
+    message = f"{APP_NAME} 已在运行，请查看系统托盘图标。"
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(APP_NAME, message)
+        root.destroy()
+    except Exception:
+        print(f"[{APP_NAME}] {message}", file=sys.stderr)
+
+
+def _run_check_once(emit: Emit) -> int:
+    from .recycle_bin_service import RecycleBinService
+
+    result = RecycleBinService().scan()
+    emit(f"{APP_NAME} 统计结果（只读）")
+    emit(f"  项目总数   : {result.total_items}")
+    emit(f"  占用空间   : {result.total_size_bytes} 字节")
+    emit(f"  查询时间   : {result.queried_at:%Y-%m-%d %H:%M:%S}")
+    emit(f"  统计完整   : {result.is_complete}")
+    for disk in result.disks:
+        state = "OK" if disk.ok else f"失败({disk.error})"
+        emit(f"    {disk.root:<5} {disk.kind.value:<9} {state} items={disk.num_items}")
+    if result.failed_roots:
+        emit(f"  失败磁盘   : {list(result.failed_roots)}")
+    if result.error:
+        emit(f"  扫描错误   : {result.error}")
+    return EXIT_OK
+
+
+def _handle_autostart(action: str, emit: Emit) -> int:
+    from . import autostart
+
+    try:
+        if action == "status":
+            enabled = autostart.is_enabled()
+            command = autostart.current_command()
+            emit(f"{APP_NAME} 开机启动：{'已启用' if enabled else '未启用'}")
+            if command:
+                emit(f"  启动命令：{command}")
+            return EXIT_OK
+        state = autostart.set_enabled(action == "on")
+    except autostart.AutostartUnsupportedError as exc:
+        print(f"[{APP_NAME}] {exc}", file=sys.stderr)
+        return EXIT_UNSUPPORTED
+
+    # 必须同步回配置文件：否则启动时 sync_start_on_login() 的自愈逻辑
+    # 会认为“配置没要求自启但注册表里有”，反过来把启动项删掉。
+    try:
+        config = load_config()
+        config.start_on_login = state
+        save_config(config)
+    except ConfigError as exc:
+        print(f"[{APP_NAME}] 开机启动已设置，但配置未能同步：{exc}", file=sys.stderr)
+    except OSError as exc:
+        print(f"[{APP_NAME}] 开机启动已设置，但配置写入失败：{exc}", file=sys.stderr)
+
+    emit(f"{APP_NAME} 开机启动已{'启用' if state else '关闭'}")
+    return EXIT_OK
+
+
+def _handle_shortcuts(install: bool, emit: Emit) -> int:
+    from . import shortcuts
+
+    if not install:
+        removed = shortcuts.uninstall_shortcuts()
+        if removed:
+            for path in removed:
+                emit(f"[{APP_NAME}] 已删除快捷方式：{path}")
+        else:
+            emit(f"[{APP_NAME}] 未找到需要删除的快捷方式")
+        return EXIT_OK
+
+    try:
+        created = shortcuts.install_shortcuts()
+    except shortcuts.ShortcutUnsupportedError as exc:
+        emit(f"[{APP_NAME}] {exc}")
+        return EXIT_UNSUPPORTED
+    if not created:
+        emit(f"[{APP_NAME}] 快捷方式创建失败，请查看日志")
+        return EXIT_UNSUPPORTED
+    for path in created:
+        emit(f"[{APP_NAME}] 已创建快捷方式：{path}")
+    return EXIT_OK
+
+
+def _handle_uninstall(purge: bool, emit: Emit) -> int:
+    from . import autostart, shortcuts
+
+    try:
+        autostart.disable()
+        emit(f"[{APP_NAME}] 已移除开机启动项")
+    except autostart.AutostartUnsupportedError as exc:
+        print(f"[{APP_NAME}] {exc}", file=sys.stderr)
+
+    try:
+        removed = shortcuts.uninstall_shortcuts()
+    except shortcuts.ShortcutUnsupportedError:
+        removed = []
+    for path in removed:
+        emit(f"[{APP_NAME}] 已删除快捷方式：{path}")
+
+    home = paths.app_home()
+    if purge:
+        shutil.rmtree(home, ignore_errors=True)
+        emit(f"[{APP_NAME}] 已删除配置与日志：{home}")
+    else:
+        emit(f"[{APP_NAME}] 已保留配置与日志：{home}（如需彻底删除请加 --purge）")
+    return EXIT_OK
+
+
+def _ensure_std_streams() -> None:
+    """GUI 子系统下 ``sys.stdout`` / ``sys.stderr`` 可能为 ``None``。
+
+    打包成“无控制台”的 EXE 后，从资源管理器双击启动时没有标准输出，
+    此时 ``print`` / ``argparse`` 会抛异常。这里兜底到 ``os.devnull``，
+    既保证命令行参数（如 ``--version``）不会被输出问题打断，
+    也保证程序仍然按 GUI 方式安静启动。
+    """
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    _ensure_std_streams()
+    args = build_parser().parse_args(argv)
+
+    with _open_report(args.report) as report:
+        emit = _make_emit(report)
+        return _dispatch(args, emit)
+
+
+def _dispatch(args: argparse.Namespace, emit: Emit) -> int:
+    if args.autostart:
+        return _handle_autostart(args.autostart, emit)
+
+    if args.install_shortcuts:
+        return _handle_shortcuts(install=True, emit=emit)
+
+    if args.remove_shortcuts:
+        return _handle_shortcuts(install=False, emit=emit)
+
+    if args.uninstall:
+        return _handle_uninstall(args.purge, emit)
+
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        print(f"[{APP_NAME}] 配置错误：{exc}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    if args.init_config:
+        emit(f"[{APP_NAME}] 已写入默认配置：{save_config(config)}")
+        return EXIT_OK
+
+    logger = setup_logging(config, to_console=args.console_log)
+
+    if args.check_once:
+        return _run_check_once(emit)
+
+    instance = SingleInstance()
+    if not instance.acquire():
+        logger.warning("检测到已有实例在运行，本次启动终止")
+        # 先尝试“唤醒”已有实例：把它的状态窗口显示出来，这是最好的反馈
+        if request_wake():
+            logger.info("已请求已有实例显示状态窗口")
+        else:
+            _warn_already_running()
+        return EXIT_ALREADY_RUNNING
+
+    try:
+        from .app import AppController
+        from .tray import run_tray
+
+        controller = AppController(config)
+        logger.info(
+            "%s %s 启动：阈值=%d 间隔=%ds 自动清理=%s 试运行=%s",
+            APP_NAME,
+            __version__,
+            config.threshold_items,
+            config.poll_interval_seconds,
+            config.auto_clean_enabled,
+            config.dry_run,
+        )
+        run_tray(controller, start_minimized=args.start_minimized)
+    except Exception:
+        logger.exception("程序异常退出")
+        raise
+    finally:
+        instance.release()
+        logger.info("%s 已退出", APP_NAME)
+    return EXIT_OK
+
+
+def crash_log_path() -> Path:
+    """崩溃日志位置（与配置、日志同目录）。"""
+    return paths.app_home() / "crash.log"
+
+
+def _write_crash_log(exc: BaseException) -> Path | None:
+    """把未捕获异常写入崩溃日志；打包成 GUI 后这是唯一的线索来源。"""
+    try:
+        paths.ensure_app_home()
+        target = crash_log_path()
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S} {APP_NAME} {__version__} ---\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=handle)
+        return target
+    except Exception:  # pragma: no cover - 连日志都写不了就只能放弃
+        return None
+
+
+def entry(argv: list[str] | None = None) -> int:
+    """真正的入口：捕获未处理异常并落盘崩溃日志，绝不静默退出。"""
+    try:
+        return main(argv)
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - 顶层兜底
+        target = _write_crash_log(exc)
+        if target is not None:
+            print(f"[{APP_NAME}] 发生未处理异常，详情见：{target}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(entry())
