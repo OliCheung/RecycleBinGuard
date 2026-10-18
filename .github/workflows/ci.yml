@@ -1,0 +1,41 @@
+name: CI
+
+# 必须在 Windows 上跑：代码依赖 msvcrt / winreg / ctypes Shell API / tkinter，
+# 且 UI 与托盘用例需要图形环境（windows-latest 自带桌面会话）。
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: 风格检查（ruff check）
+        run: python -m ruff check .
+
+      - name: 格式检查（ruff format）
+        run: python -m ruff format --check .
+
+      - name: 类型检查（mypy）
+        run: python -m mypy
+
+      - name: 单元测试
+        run: python -m pytest -q

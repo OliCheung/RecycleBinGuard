@@ -11,17 +11,18 @@
 
 - 程序一旦触发，会清空**所有本机固定磁盘**的回收站，包括你手动删除、可能还想恢复的文件；
 - 本手册要求你在**专用环境**执行，并在开始前创建快照 / 系统还原点；
-- 程序**不需要管理员权限**、不联网、不上传任何数据；
-- 自动化测试永远不会执行真实清空，只有你在第 4 章手动关闭 `dry_run` 才会真的清空。
+- 程序**不需要管理员权限**；除自动升级检查（GitHub Releases）外不联网、不上传任何数据；
+- 自动化测试永远不会执行真实清空；真实清空只在你按第 4 章在专用环境手动触发时发生。
 
-### 全程安全默认值
+### 安全网（默认开启，但每次都经你确认）
 
 | 配置 | 默认 | 含义 |
 | --- | --- | --- |
-| `auto_clean_enabled` | `false` | 只监控，不清空 |
-| `dry_run` | `true` | 即使达到阈值也只记录，绝不调用清空 API |
+| `auto_clean_enabled` | `true` | 默认开启自动清理；但每次清理前都会弹确认框 |
+| `confirm_before_clean` | `true` | 达到阈值后先弹确认窗；取消 / 关闭 / 倒计时归零进复核都不直接清空 |
+| `auto_clean_confirmed` | `false` | 关闭后再启用自动清理前，需确认一次不可逆删除风险 |
 
-**只要这两个值保持默认，程序在任何情况下都不会删你的文件。**
+**程序默认就会自动清理，但每一次真实清空前都会弹确认框；把 `auto_clean_enabled` 设为 `false` 即回到“只监控、不清空”。** `dry_run` 试运行模式已移除。
 
 ---
 
@@ -62,7 +63,7 @@ RecycleBinGuard.exe --install-shortcuts
 python -m recyclebingguard --check-once
 
 # 或使用打包后的 EXE（无控制台，用 --report 落盘）
-& "D:\RecycleBinGuard\dist\RecycleBinGuard\RecycleBinGuard.exe" --check-once --report "$env:USERPROFILE\Desktop\rbg-check.txt"
+& "D:\RecycleBinGuard\dist\RecycleBinGuard.exe" --check-once --report "$env:USERPROFILE\Desktop\rbg-check.txt"
 Get-Content "$env:USERPROFILE\Desktop\rbg-check.txt"
 ```
 
@@ -75,9 +76,9 @@ Get-Content "$env:USERPROFILE\Desktop\rbg-check.txt"
 
 ---
 
-## 3. 阶段 B：dry-run 触发验证（仍然不会删除任何东西）
+## 3. 阶段 B：只监控模式触发验证（`auto_clean_enabled=false`，不会删除任何东西）
 
-目的：在不真正清空的前提下，验证「达到阈值 → 记录会触发」这条链路。
+目的：在**关闭自动清理**的前提下，验证「达到阈值 → 记录会触发、但不清理」这条链路。
 
 > **不要为了测试真的往回收站塞 10,000 个文件**，把阈值临时调小即可。
 
@@ -85,7 +86,7 @@ Get-Content "$env:USERPROFILE\Desktop\rbg-check.txt"
 
 ```powershell
 python -m recyclebingguard --init-config
-notepad "$env:LOCALAPPDATA\RecycleBinGuard\config.json"
+notepad ".\config.json"          # 程序（EXE）所在目录，即当前工作目录
 ```
 
 改成：
@@ -94,13 +95,11 @@ notepad "$env:LOCALAPPDATA\RecycleBinGuard\config.json"
 {
   "threshold_items": 3,
   "poll_interval_seconds": 10,
-  "auto_clean_enabled": true,
-  "auto_clean_confirmed": true,
-  "dry_run": true
+  "auto_clean_enabled": false
 }
 ```
 
-`dry_run: true` 是关键——即使 `auto_clean_enabled` 为 true 也**绝不会**调用清空 API。
+`auto_clean_enabled: false` 是关键——即使达到阈值也**只会记录、不会**调用清空 API（这就是旧的“试运行”等效模式）。
 
 ### 3.2 制造 3 个以上的回收站项目
 
@@ -119,13 +118,13 @@ Get-ChildItem $dir | ForEach-Object {
 ### 3.3 观察
 
 ```powershell
-Get-Content "$env:LOCALAPPDATA\RecycleBinGuard\logs\recyclebingguard.log" -Tail 20 -Wait
+Get-Content ".\logs\recyclebingguard.log" -Tail 20 -Wait
 ```
 
 **通过标准**
 
 - [ ] 出现 `达到阈值：项目数=5 阈值=3`；
-- [ ] 紧接着出现 `试运行模式：本次会触发清理，但不会调用清空 API`；
+- [ ] 自动清理关闭，达到阈值后**仅记录、不弹确认框、不清理**；
 - [ ] 状态在 `idle -> checking -> threshold_reached -> idle` 之间迁移；
 - [ ] **回收站项目数没有变化**（再用第 1 步的 Shell 口径确认，仍是 5 个左右）。
 
@@ -159,7 +158,7 @@ if (Test-Path "X:\") {
 "sentinel" | Out-File "$env:USERPROFILE\Desktop\rbg-sentinel.txt"
 ```
 
-### 4.2 关闭 dry-run
+### 4.2 开启自动清理（默认即为开启）
 
 把 `config.json` 改成：
 
@@ -168,8 +167,7 @@ if (Test-Path "X:\") {
   "threshold_items": 3,
   "poll_interval_seconds": 10,
   "auto_clean_enabled": true,
-  "auto_clean_confirmed": true,
-  "dry_run": false
+  "auto_clean_confirmed": true
 }
 ```
 
@@ -178,7 +176,7 @@ if (Test-Path "X:\") {
 ### 4.3 观察清理过程
 
 ```powershell
-$log = "$env:LOCALAPPDATA\RecycleBinGuard\logs\recyclebingguard.log"
+$log = ".\logs\recyclebingguard.log"
 Get-Content $log -Tail 30 -Wait
 ```
 
@@ -197,7 +195,7 @@ Get-Content $log -Tail 30 -Wait
 
 ### 4.4 验证“统计不完整则不清理”（可选但强烈建议）
 
-1. 保持 `dry_run: false`、阈值 3；
+1. 保持 `auto_clean_enabled: true`、阈值 3；
 2. 用管理员权限打开一个句柄占住某个盘的回收站，或临时把某块固定磁盘拔掉/禁用；
 3. 重启程序，确认日志出现 `统计不完整，本轮不做任何清理`，且**没有** `开始清空回收站` 行。
 
@@ -211,7 +209,7 @@ Get-Content $log -Tail 30 -Wait
 
 ```powershell
 # 1) 立即关闭自动清理（托盘右键 → 关闭自动清理，或直接改配置）
-notepad "$env:LOCALAPPDATA\RecycleBinGuard\config.json"   # dry_run 改回 true，auto_clean_enabled 改回 false
+notepad ".\config.json"   # auto_clean_enabled 改回 false
 
 # 2) 关闭开机启动
 & "...\RecycleBinGuard.exe" --autostart off
@@ -227,14 +225,14 @@ Get-Process RecycleBinGuard -ErrorAction SilentlyContinue
 Remove-Item "$env:USERPROFILE\Desktop\rbg-sentinel.txt" -ErrorAction SilentlyContinue
 ```
 
-**恢复日常使用**：确认 `dry_run: true`、`auto_clean_enabled: false`，
-再把 `threshold_items` 改回 `10000`、`poll_interval_seconds` 改回 `180`。
+**恢复日常使用**：确认 `auto_clean_enabled: true`、`confirm_before_clean: true`，
+再把 `threshold_items` 改回 `10000`、`poll_interval_seconds` 改回 `600`。
 
 ---
 
 ## 6. 长期运行验证（T5 第 9 项）
 
-在**只监控、不清空**（`dry_run: true`）的状态下挂着跑 3–7 天：
+在**只监控、不清空**（`auto_clean_enabled: false`）的状态下挂着跑 3–7 天：
 
 ```powershell
 # 每 10 分钟采样一次内存与句柄
@@ -258,7 +256,7 @@ while ($true) {
 
 在**没有安装 Python** 的干净 Windows 10 x64 中：
 
-- [ ] 把 `dist\RecycleBinGuard` 整个目录拷过去，双击 `RecycleBinGuard.exe` 能启动；
+- [ ] 把 `dist\RecycleBinGuard.exe` 单个文件拷过去，双击能启动；
 - [ ] 托盘出现图标，状态窗口能打开；
 - [ ] 重复双击 → 弹出「已在运行」提示，任务管理器中**只有一个**进程；
 - [ ] 勾选「开机启动设置」→ 注销并重新登录 → 托盘图标自动出现；
@@ -276,11 +274,11 @@ while ($true) {
 
 | 现象 | 排查 |
 | --- | --- |
-| 程序启动后没有任何反应 | 看 `%LOCALAPPDATA%\RecycleBinGuard\logs\recyclebingguard.log`；若文件都不存在，看同目录 `crash.log` |
+| 程序启动后没有任何反应 | 看**程序所在目录**下的 `logs\recyclebingguard.log`；若文件都不存在，看同目录 `crash.log` |
 | 双击无反应且疑似已在运行 | 任务管理器结束 `RecycleBinGuard.exe`；锁由操作系统持有，强杀后会自动释放 |
 | 状态显示「统计不完整」 | 查看日志中 `回收站统计失败` 行的磁盘与 HRESULT；修复该磁盘后会自动恢复正常 |
 | 托盘提示「清理失败 / 部分清理」 | 日志中 `清理未成功：outcome=partial|failed|incomplete`；程序会退避 300 秒再试，**不会**在同一轮无限重试 |
-| 想确认程序到底会不会删东西 | 保持 `dry_run: true` 观察日志，只会出现「试运行模式：本次会触发清理」 |
+| 想确认程序到底会不会删东西 | 把 `auto_clean_enabled` 设为 `false` 观察日志，达到阈值只会记录、不会出现「开始清空回收站」 |
 | 想看程序统计了什么 | `RecycleBinGuard.exe --check-once --report out.txt`，然后打开 `out.txt` |
 
 日志中**永远不会**出现文件内容、文件名清单或用户目录扫描结果；
@@ -293,7 +291,7 @@ while ($true) {
 ```
 环境：□ 虚拟机 / □ 专用 Windows 用户        日期：__________
 阶段 A 只读基线           : □ 通过  □ 不通过
-阶段 B dry-run 触发       : □ 通过  □ 不通过
+阶段 B 只监控触发         : □ 通过  □ 不通过
 阶段 C 真实清空           : □ 通过  □ 不通过
 阶段 D 收尾与恢复         : □ 通过  □ 不通过
 统计不完整不清理          : □ 通过  □ 未验证
@@ -301,5 +299,5 @@ while ($true) {
 长期运行资源稳定          : □ 通过  □ 未验证（运行 __ 小时）
 干净环境安装/卸载         : □ 通过  □ 不通过
 备注：________________________________________________
-决策：□ 可在日常电脑启用自动清理   □ 继续维持 dry_run
+决策：□ 可在日常电脑保持自动清理开启   □ 关闭自动清理只监控
 ```

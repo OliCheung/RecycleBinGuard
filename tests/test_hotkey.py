@@ -12,14 +12,13 @@ import threading
 import pytest
 
 from recyclebingguard.hotkey import (
+    DEFAULT_MODIFIERS,
+    DEFAULT_VK,
     HOTKEY_LABEL,
     MOD_ALT,
     MOD_CONTROL,
     MOD_NOREPEAT,
-    DEFAULT_MODIFIERS,
-    DEFAULT_VK,
     HotkeyListener,
-
 )
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="仅 Windows 支持全局热键")
@@ -61,8 +60,8 @@ def test_duplicate_hotkey_registration_fails_gracefully() -> None:
     second = HotkeyListener(lambda: None, modifiers=TEST_MODIFIERS, virtual_key=TEST_VK)
     try:
         assert first.start() is True
-        assert second.start() is False      # 同一组合被占用
-        assert second.error                # 必须有可读的原因
+        assert second.start() is False  # 同一组合被占用
+        assert second.error  # 必须有可读的原因
         assert second.running is False
     finally:
         first.stop()

@@ -61,9 +61,7 @@ def default_command() -> str:
     return f'"{interpreter}" -m recyclebingguard {MINIMIZED_ARG}'
 
 
-def current_command(
-    key_path: str = RUN_KEY_PATH, value_name: str = VALUE_NAME
-) -> str | None:
+def current_command(key_path: str = RUN_KEY_PATH, value_name: str = VALUE_NAME) -> str | None:
     """读取已注册的启动命令；未设置返回 ``None``。"""
     _require_windows()
     import winreg
@@ -96,26 +94,20 @@ def enable(
     if command is None:
         command = default_command()
 
-    with winreg.CreateKeyEx(
-        winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
-    ) as key:
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
         winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, command)
 
     logger.info("已启用开机启动：%s = %s", value_name, command)
     return command
 
 
-def disable(
-    key_path: str = RUN_KEY_PATH, value_name: str = VALUE_NAME
-) -> bool:
+def disable(key_path: str = RUN_KEY_PATH, value_name: str = VALUE_NAME) -> bool:
     """移除开机启动项；返回是否确实删除了内容。"""
     _require_windows()
     import winreg
 
     try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
-        ) as key:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
             winreg.DeleteValue(key, value_name)
     except FileNotFoundError:
         logger.info("开机启动项本就不存在：%s", value_name)

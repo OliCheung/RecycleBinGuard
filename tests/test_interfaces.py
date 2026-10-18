@@ -7,15 +7,16 @@ from datetime import datetime
 import pytest
 
 from recyclebingguard.interfaces import (
+    INCLUDED_DRIVE_KINDS,
     CleanOutcome,
     CleanResult,
     DiskScanResult,
     DriveKind,
-    INCLUDED_DRIVE_KINDS,
     MonitorState,
     RecycleBinMonitor,
     RecycleBinService,
     ScanResult,
+    normalize_root,
 )
 
 
@@ -57,6 +58,47 @@ def test_scan_level_error_blocks_trigger() -> None:
     result = ScanResult(total_items=50000, total_size_bytes=0, error="未枚举到固定磁盘")
     assert result.is_complete is False
     assert result.should_trigger(10000) is False
+
+
+def test_size_threshold_is_an_independent_trigger() -> None:
+    """占用大小阈值是第二条触发条件（``0`` = 不启用）。"""
+    result = ScanResult(total_items=10, total_size_bytes=5 * 1024**3, scanned_roots=("C:\\",))
+
+    assert result.should_trigger(10000, 0) is False
+    assert result.should_trigger(10000, 5 * 1024**3) is True
+    assert result.should_trigger(5, 0) is True
+
+
+def test_size_threshold_is_ignored_when_zero() -> None:
+    result = ScanResult(total_items=1, total_size_bytes=10**12, scanned_roots=("C:\\",))
+    assert result.should_trigger(2, 0) is False
+
+
+def test_incomplete_scan_never_triggers_on_size() -> None:
+    result = ScanResult(
+        total_items=1,
+        total_size_bytes=10**12,
+        scanned_roots=("C:\\",),
+        failed_roots=("D:\\",),
+    )
+    assert result.should_trigger(1, 1) is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("d:", "D:\\"),
+        ("D:/", "D:\\"),
+        ("D:\\", "D:\\"),
+        (" c: ", "C:\\"),
+        ("", ""),
+        ("not a drive", ""),
+        ("\\\\server\\share", ""),
+        ("1:", ""),
+    ],
+)
+def test_normalize_root(raw: str, expected: str) -> None:
+    assert normalize_root(raw) == expected
 
 
 def test_scan_result_defaults() -> None:
@@ -107,7 +149,9 @@ def test_protocols_are_runtime_checkable() -> None:
         def scan(self) -> ScanResult:  # pragma: no cover - 仅用于结构检查
             raise NotImplementedError
 
-        def empty(self) -> CleanResult:  # pragma: no cover
+        def empty(
+            self, *, verified_scan: ScanResult | None = None
+        ) -> CleanResult:  # pragma: no cover
             raise NotImplementedError
 
     class FakeMonitor:

@@ -6,6 +6,8 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
@@ -18,9 +20,14 @@ env/
 *.spec.bak
 packaging/recyclebingguard.ico
 
-# 本地运行时数据（正常位于 %LOCALAPPDATA%，此处兜底）
+# 本地运行时数据（默认位于程序 / 项目目录，绝不入库）
 *.log
 local_data/
+logs/
+clean_history.json
+crash.log
+wake.request
+RecycleBinGuard.lock
 
 # 代理/工具内存（含个人上下文，勿入库）
 .workbuddy/
@@ -34,6 +41,7 @@ local_data/
 
 # 真实运行时配置（仅提交 config.example.json）
 config.json
+config.json.bad-*
 
 # 散落二进制（dist/、build/ 已忽略，此处兜底）
 *.exe

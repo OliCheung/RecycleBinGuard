@@ -15,17 +15,23 @@
 
 from __future__ import annotations
 
+import os
 import queue
+import tempfile
 import threading
+import time
 import tkinter as tk
+from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
-from typing import Callable
+from typing import Any
 
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw
 
-from . import APP_NAME, __version__
+from . import APP_NAME, __version__, assets
+from . import updater as updater_module
 from .app import (
     LABEL_AUTO_ON,
     RISK_NOTICE,
@@ -33,26 +39,41 @@ from .app import (
     AppController,
     RiskConfirmationRequired,
 )
+from .appearance import AUTO_RECHECK_SECONDS
 from .confirm_dialog import CleanConfirmDialog
 from .confirmation import CleanConfirmationRequest, ConfirmationDecision
 from .hotkey import HOTKEY_LABEL, HotkeyListener
 from .interfaces import CleanOutcome, MonitorState
 from .logging_setup import get_logger
+from .settings_dialog import SettingsDialog
 from .single_instance import take_wake_request
+from .theme import (
+    Card,
+    HeroCard,
+    Palette,
+    Switch,
+    ThemedFrame,
+    ThemedLabel,
+    ThemeManager,
+    retheme_tree,
+)
+from .updater import LocalUpdate, ReleaseInfo
 
 logger = get_logger()
 
 #: 主线程轮询间隔（毫秒）：既用于刷新界面，也用于处理托盘线程投递的请求。
 UI_TICK_MS = 500
 
-_STATE_COLORS: dict[MonitorState, str] = {
-    MonitorState.IDLE: "#2E7D32",
-    MonitorState.CHECKING: "#2E7D32",
-    MonitorState.PAUSED: "#616161",
-    MonitorState.THRESHOLD_REACHED: "#EF6C00",
-    MonitorState.AWAITING_CONFIRMATION: "#EF6C00",
-    MonitorState.CLEANING: "#EF6C00",
-    MonitorState.VERIFYING: "#EF6C00",
+#: 状态 -> 托盘图标配色。``None`` 表示保留不锈钢原色（不重着色）。
+#: 约定：正常=原色、暂停=橙、待确认=黄、清理中=蓝、错误=红。
+_STATE_COLORS: dict[MonitorState, str | None] = {
+    MonitorState.IDLE: None,
+    MonitorState.CHECKING: None,
+    MonitorState.PAUSED: "#EF6C00",
+    MonitorState.THRESHOLD_REACHED: "#FBC02D",
+    MonitorState.AWAITING_CONFIRMATION: "#FBC02D",
+    MonitorState.CLEANING: "#1565C0",
+    MonitorState.VERIFYING: "#1565C0",
     MonitorState.ERROR: "#C62828",
 }
 
@@ -63,9 +84,53 @@ _CLEAN_OUTCOME_TEXT: dict[CleanOutcome, str] = {
     CleanOutcome.INCOMPLETE: "结果未确认（统计不完整）",
 }
 
+#: 任务栏分组标识：不设置的话 Windows 会把窗口归到 python.exe / 解释器图标下。
+APP_USER_MODEL_ID = f"{APP_NAME}.App"
 
-def create_icon_image(color: str = "#2E7D32", size: int = 64) -> Image.Image:
-    """生成托盘图标（一个简洁的回收站形状）。"""
+
+def _set_app_user_model_id() -> None:
+    """向 Windows 声明本程序身份，任务栏与通知才用得上我们自己的图标。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+    except Exception:  # pragma: no cover - 老系统 / 受限环境
+        logger.debug("设置 AppUserModelID 失败", exc_info=True)
+
+
+#: 资源缺失时内置画法使用的颜色（与 IDLE 状态一致）。
+DEFAULT_ICON_COLOR = "#2E7D32"
+
+
+def _parse_color(color: str) -> tuple[int, int, int]:
+    """把 ``#RRGGBB`` / 颜色名解析成 RGB 三元组。"""
+    r, g, b = ImageColor.getrgb(color)[:3]
+    return int(r), int(g), int(b)
+
+
+def _tint(image: Image.Image, color: str) -> Image.Image:
+    """把图标重着色为 ``color``，同时保留金属高光与明暗层次。
+
+    做法：以原图亮度为系数缩放目标色（高光接近原色、暗部压暗），alpha 通道
+    原样保留 —— 这样菱形网格的镂空处仍然是透明的。
+    """
+    red, green, blue = _parse_color(color)
+    luminance = image.convert("L").point(lambda v: int(26 + 0.88 * v))
+    return Image.merge(
+        "RGBA",
+        (
+            luminance.point(lambda v: min(255, red * v // 255)),
+            luminance.point(lambda v: min(255, green * v // 255)),
+            luminance.point(lambda v: min(255, blue * v // 255)),
+            image.getchannel("A"),
+        ),
+    )
+
+
+def _draw_fallback_icon(color: str, size: int) -> Image.Image:
+    """内置的矢量画法：仅在图标资源缺失时兜底，保证托盘永远有图标。"""
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
 
@@ -86,6 +151,20 @@ def create_icon_image(color: str = "#2E7D32", size: int = 64) -> Image.Image:
     return image
 
 
+def create_icon_image(color: str | None = DEFAULT_ICON_COLOR, size: int = 64) -> Image.Image:
+    """生成托盘图标：以 ``assets/icon.png``（真实照片）为底，按状态着色。
+
+    :param color: 状态色；传 ``None`` 保留不锈钢原色（用于 .ico 等品牌场景）。
+    :param size: 输出边长（正方形）。
+    """
+    source = assets.load_icon(size)
+    if source is None:  # 资源缺失：退回内置画法，图标不至于消失
+        return _draw_fallback_icon(color or DEFAULT_ICON_COLOR, size)
+    if color is None:
+        return source
+    return _tint(source, color)
+
+
 def _format_time(value: datetime | None) -> str:
     return value.strftime("%H:%M:%S") if value is not None else "—"
 
@@ -93,12 +172,20 @@ def _format_time(value: datetime | None) -> str:
 class TrayApplication:
     """托盘应用：组合托盘图标与 tkinter 状态窗口。"""
 
-    def __init__(self, controller: AppController, *, start_minimized: bool = False) -> None:
+    def __init__(
+        self,
+        controller: AppController,
+        *,
+        start_minimized: bool = False,
+        on_apply_update: Callable[[Path], None] | None = None,
+    ) -> None:
         self._controller = controller
-        self._ui_queue: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        self._ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         self._stopping = False
         #: 登录自启时为 True：静默驻留托盘，不弹窗。
         self._start_minimized = start_minimized
+        #: 收到并校验新版本后的换包回调（由 __main__ 注入，释放锁 + 启动新 EXE + 退出）。
+        self._on_apply_update = on_apply_update
         self._hotkey = HotkeyListener(self._post_hotkey)
 
         self._last_error_seen: str | None = None
@@ -107,8 +194,18 @@ class TrayApplication:
         self._tick_count = 0
         self._autostart_cached = False
 
+        # 自动升级：首次检查延迟约 30s，之后每 6h 一次（节流在 _maybe_check_update）。
+        self._last_update_check = time.monotonic() - (
+            updater_module.UPDATE_CHECK_INTERVAL_SECONDS
+            - updater_module.UPDATE_FIRST_CHECK_DELAY_SECONDS
+        )
+        self._update_checking = False
+        self._pending_update: ReleaseInfo | LocalUpdate | None = None
+
         #: 同一时刻最多一个清理确认弹窗。
         self._confirm_dialog: CleanConfirmDialog | None = None
+        #: 同一时刻最多一个设置对话框。
+        self._settings_dialog: SettingsDialog | None = None
         # 监控线程（后台）通过控制器回调提交弹窗请求，这里负责投递到主线程。
         controller.on_confirmation_request = self._request_clean_confirmation
 
@@ -119,8 +216,17 @@ class TrayApplication:
         self._root.withdraw()
         self._root.title(f"{APP_NAME} v{__version__}")
         self._root.protocol("WM_DELETE_WINDOW", self._hide_window)
+        #: 皮肤管理器：模式来自配置（auto / light / dark），自动模式按系统时间判定。
+        self._theme = ThemeManager(self._root, mode=self._controller.config.theme)
+        #: 自动模式的周期性判定计数（每 ``AUTO_RECHECK_SECONDS`` 秒检查一次分界）。
+        self._theme_ticks = 0
+        #: 窗口 / 任务栏图标（必须持有引用：PhotoImage 被回收后图标会变空白）。
+        self._window_icon: Any = None
+        self._apply_window_icon()
 
         self._build_window()
+        # 注册换肤回调：之后每次切换皮肤都会刷新主窗口（含在线换肤）
+        self._unregister_theme = self._theme.register(self._apply_palette)
         # 托盘图标延迟到 run() 才真正创建：
         # pystray 的 win32 Icon 一旦被构造却从未 run()，垃圾回收时 __del__ 会抛
         # “不可捕获异常”（_icon_handle 未初始化），在测试里表现为随机的
@@ -129,32 +235,61 @@ class TrayApplication:
         self._icon: pystray.Icon | None = None
 
     # ------------------------------------------------------------------
+    # 图标
+    # ------------------------------------------------------------------
+
+    def _apply_window_icon(self) -> None:
+        """给主窗口 / 任务栏 / 后续对话框设置图标（资源缺失时静默跳过）。"""
+        image = assets.load_icon(assets.MAX_ICON_SIZE)
+        if image is None:  # 缺资源不值得让界面起不来
+            logger.debug("未找到图标资源：%s", assets.icon_file())
+            return
+        try:
+            from PIL import ImageTk
+
+            self._window_icon = ImageTk.PhotoImage(image)
+            # default=True：之后创建的 Toplevel（设置 / 清理确认对话框）自动继承
+            self._root.iconphoto(True, self._window_icon)
+        except Exception:  # pragma: no cover - 极端环境下没有 Tk 图像支持
+            logger.debug("设置窗口图标失败", exc_info=True)
+
+    # ------------------------------------------------------------------
     # 构建界面
     # ------------------------------------------------------------------
 
     def _build_window(self) -> None:
+        """构建状态窗口：英雄卡（状态 + 大数字 + 进度）+ 概览 + 选项 + 操作。"""
         root = self._root
+        palette = self._theme.palette
+        font = self._theme.font_family
         root.minsize(420, 400)
 
-        frame = ttk.Frame(root, padding=16)
-        frame.pack(fill="both", expand=True)
-        frame.columnconfigure(1, weight=1)
+        outer = ThemedFrame(root, palette)
+        outer.pack(fill="both", expand=True, padx=16, pady=16)
 
-        self._lbl_state = ttk.Label(frame, text="", font=("Segoe UI", 11))
-        self._lbl_state.grid(row=0, column=0, columnspan=2, sticky="w")
+        # -- 顶部英雄卡 --
+        self._hero = HeroCard(outer, palette)
+        self._hero.pack(fill="x")
+        # 沿用旧属性名，避免破坏既有调用点（测试 / 菜单）
+        self._lbl_state = self._hero.state_label
+        self._lbl_count = self._hero.count_label
 
-        self._lbl_count = ttk.Label(frame, text="—", font=("Segoe UI", 26, "bold"))
-        self._lbl_count.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        # -- 运行概览 --
+        ThemedLabel(
+            outer,
+            palette,
+            bg="canvas",
+            fg="text_muted",
+            text="运行概览",
+            font=(font, 9, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(14, 6))
 
-        ttk.Label(frame, text="回收站项目总数 / 触发阈值").grid(
-            row=2, column=0, columnspan=2, sticky="w"
-        )
+        overview = Card(outer, palette, stretch=True, padding=12)
+        overview.pack(fill="x")
+        overview.body.columnconfigure(1, weight=1)
 
-        ttk.Separator(frame, orient="horizontal").grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=12
-        )
-
-        self._rows: dict[str, ttk.Label] = {}
+        self._rows: dict[str, ThemedLabel] = {}
         for index, (key, title) in enumerate(
             (
                 ("threshold", "触发阈值"),
@@ -165,40 +300,65 @@ class TrayApplication:
                 ("autostart", "开机启动"),
                 ("error", "最近错误"),
                 ("config", "配置文件"),
-            ),
-            start=4,
+            )
         ):
-            ttk.Label(frame, text=f"{title}：").grid(row=index, column=0, sticky="w", pady=2)
-            value = ttk.Label(frame, text="—", wraplength=280, justify="left")
-            value.grid(row=index, column=1, sticky="w", pady=2)
+            ThemedLabel(
+                overview.body,
+                palette,
+                bg="surface",
+                fg="text_muted",
+                text=title,
+                font=(font, 9),
+                anchor="w",
+            ).grid(row=index, column=0, sticky="nw", pady=3)
+            value = ThemedLabel(
+                overview.body,
+                palette,
+                bg="surface",
+                fg="text",
+                text="—",
+                wraplength=248,
+                justify="left",
+                anchor="w",
+                font=(font, 9),
+            )
+            value.grid(row=index, column=1, sticky="w", pady=3, padx=(10, 0))
             self._rows[key] = value
 
-        options = ttk.LabelFrame(frame, text="选项", padding=10)
-        options.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        # -- 选项（开关样式）--
+        ThemedLabel(
+            outer,
+            palette,
+            bg="canvas",
+            fg="text_muted",
+            text="选项",
+            font=(font, 9, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(14, 6))
+
+        options = Card(outer, palette, stretch=True, padding=12)
+        options.pack(fill="x")
+        options.body.columnconfigure(0, weight=1)
 
         self._var_auto = tk.BooleanVar(value=False)
-        self._var_dry = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            options,
-            text="自动清理（达到阈值后自动清空回收站）",
-            variable=self._var_auto,
-            command=self._on_auto_checkbox,
-        ).pack(anchor="w")
-        ttk.Checkbutton(
-            options,
-            text="试运行模式（只记录，不调用清空）",
-            variable=self._var_dry,
-            command=self._on_dry_checkbox,
-        ).pack(anchor="w")
+        self._build_option_row(
+            options.body,
+            0,
+            "自动清理",
+            "达到阈值后自动清空回收站（清理前会确认）",
+            self._var_auto,
+            self._on_auto_checkbox,
+        )
 
-        buttons = ttk.Frame(frame)
-        buttons.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        # -- 操作按钮 --
+        buttons = ThemedFrame(outer, palette)
+        buttons.pack(fill="x", pady=(14, 0))
         for column in range(2):
             buttons.columnconfigure(column, weight=1)
 
-        ttk.Button(buttons, text="立即检查", command=self._on_check_now).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4), pady=4
-        )
+        ttk.Button(
+            buttons, text="立即检查", style="Accent.TButton", command=self._on_check_now
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=4)
         self._btn_pause = ttk.Button(buttons, text="暂停监控", command=self._on_toggle_pause)
         self._btn_pause.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=4)
 
@@ -209,21 +369,65 @@ class TrayApplication:
             row=1, column=1, sticky="ew", padx=(4, 0), pady=4
         )
 
-        ttk.Button(frame, text="退出程序", command=self._quit).grid(
-            row=14, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+        ttk.Button(buttons, text="设置…", command=self._on_settings).grid(
+            row=2, column=0, sticky="ew", padx=(0, 4), pady=4
+        )
+        self._btn_theme = ttk.Button(
+            buttons, text=self._theme_button_text(), command=self._on_cycle_theme
+        )
+        self._btn_theme.grid(row=2, column=1, sticky="ew", padx=(4, 0), pady=4)
+
+        ttk.Button(buttons, text="退出程序", command=self._quit).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0)
+        )
+
+    def _build_option_row(
+        self,
+        parent: tk.Misc,
+        row: int,
+        title: str,
+        hint: str,
+        variable: tk.BooleanVar,
+        command: Callable[[], None],
+    ) -> None:
+        """一行“标题 + 说明 + 开关”。"""
+        palette = self._theme.palette
+        font = self._theme.font_family
+        holder = ThemedFrame(parent, palette, bg="surface")
+        holder.grid(row=row, column=0, sticky="ew", pady=(0 if row == 0 else 8, 0))
+        holder.columnconfigure(0, weight=1)
+
+        ThemedLabel(
+            holder,
+            palette,
+            bg="surface",
+            fg="text",
+            text=title,
+            font=(font, 9),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        ThemedLabel(
+            holder,
+            palette,
+            bg="surface",
+            fg="text_muted",
+            text=hint,
+            font=(font, 8),
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w")
+
+        Switch(holder, variable, palette, command=command, bg="surface").grid(
+            row=0, column=1, rowspan=2, sticky="e", padx=(10, 0)
         )
 
     def _build_menu(self) -> pystray.Menu:
         return pystray.Menu(
             pystray.MenuItem("打开状态窗口", self._menu_open_window, default=True),
             pystray.MenuItem("立即检查", self._menu_check_now),
+            pystray.MenuItem("设置…", self._menu_settings),
+            pystray.MenuItem(self._theme_menu_text, self._menu_cycle_theme),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._auto_clean_menu_text, self._menu_toggle_auto_clean),
-            pystray.MenuItem(
-                "试运行模式",
-                self._menu_toggle_dry_run,
-                checked=lambda item: self._controller.config.dry_run,
-            ),
             pystray.MenuItem(
                 f"打开热键（{HOTKEY_LABEL}）",
                 self._menu_toggle_hotkey,
@@ -234,6 +438,9 @@ class TrayApplication:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("查看最近清理日志", self._menu_show_logs),
             pystray.MenuItem("查看清理历史", self._menu_show_clean_history),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("检查更新", self._menu_check_update),
+            pystray.MenuItem("安装更新", self._menu_install_update),
             pystray.MenuItem(
                 "开机启动设置",
                 self._menu_toggle_autostart,
@@ -245,6 +452,13 @@ class TrayApplication:
 
     def _auto_clean_menu_text(self, item: pystray.MenuItem) -> str:
         return "关闭自动清理" if self._controller.config.auto_clean_enabled else "启用自动清理"
+
+    def _theme_menu_text(self, item: pystray.MenuItem) -> str:
+        return self._theme_button_text()
+
+    def _theme_button_text(self) -> str:
+        """按钮 / 菜单项文案：当前模式 + 自动模式下的实际皮肤。"""
+        return f"皮肤：{self._theme.label()}"
 
     def _autostart_checked(self, item: pystray.MenuItem) -> bool:
         try:
@@ -258,11 +472,13 @@ class TrayApplication:
 
     def run(self) -> None:
         """启动托盘图标与主窗口事件循环（阻塞直到退出）。"""
+        _set_app_user_model_id()
         self._controller.start()
 
         self._icon = pystray.Icon(
             APP_NAME,
-            create_icon_image(),
+            # 初始即“正常”状态：保留不锈钢原色，之后按 _STATE_COLORS 切换。
+            create_icon_image(None),
             APP_NAME,
             menu=self._build_menu(),
         )
@@ -310,7 +526,49 @@ class TrayApplication:
         if take_wake_request():
             self._show_window()
         self._refresh()
+        self._maybe_refresh_theme()
+        self._maybe_check_update()
         self._root.after(UI_TICK_MS, self._tick)
+
+    def _maybe_refresh_theme(self) -> None:
+        """自动模式下周期性检查：跨过白天 / 夜间分界时自动换肤。"""
+        self._theme_ticks += 1
+        if self._theme_ticks * UI_TICK_MS < AUTO_RECHECK_SECONDS * 1000:
+            return
+        self._theme_ticks = 0
+        try:
+            if self._theme.refresh():
+                logger.info("皮肤已按系统时间自动切换为 %s", self._theme.resolved)
+            self._refresh_theme_button()
+        except Exception:  # 换肤失败不能影响主循环
+            logger.exception("自动切换皮肤失败")
+
+    def _refresh_theme_button(self) -> None:
+        try:
+            self._btn_theme.configure(text=self._theme_button_text())
+        except (tk.TclError, AttributeError):  # pragma: no cover - 窗口已销毁
+            logger.debug("刷新皮肤按钮失败", exc_info=True)
+
+    def _on_cycle_theme(self) -> None:
+        """手动换皮肤：跟随系统时间 -> 浅色 -> 深色 -> 跟随系统时间。"""
+        try:
+            mode = self._controller.cycle_theme()
+        except Exception as exc:  # 不静默
+            logger.exception("切换皮肤失败")
+            messagebox.showerror(APP_NAME, f"切换皮肤失败：{exc}", parent=self._root)
+            return
+        self._theme.set_mode(mode)
+        self._refresh_theme_button()
+        logger.info("用户切换皮肤：%s", mode)
+
+    def _apply_palette(self, palette: Palette) -> None:
+        """换肤回调：刷新主窗口底色与全部自绘控件。"""
+        try:
+            self._root.configure(bg=palette.canvas)
+        except tk.TclError:  # pragma: no cover - 根窗口已销毁
+            return
+        retheme_tree(self._root, palette)
+        self._refresh_theme_button()
 
     def _drain_ui_queue(self) -> None:
         while True:
@@ -346,7 +604,7 @@ class TrayApplication:
             return
         try:
             self._confirm_dialog = CleanConfirmDialog(
-                self._root, request, self._on_confirmation_decided
+                self._root, request, self._on_confirmation_decided, theme=self._theme
             )
         except Exception:
             logger.exception("创建清理确认弹窗失败，本轮取消清理")
@@ -366,28 +624,43 @@ class TrayApplication:
         status = self._controller.status()
         scan = status.last_scan
 
-        self._lbl_state.configure(text=self._controller.state_summary(status))
-        self._lbl_count.configure(
-            text=f"{scan.total_items:,}" if scan is not None else "—"
+        # 英雄卡：状态徽标 + 大字号项目数 + 距阈值进度
+        count_text = f"{scan.total_items:,}" if scan is not None else "—"
+        threshold_items = max(1, self._controller.config.threshold_items)
+        ratio = (scan.total_items / threshold_items) if scan is not None else 0.0
+        self._hero.set_values(
+            state_text=self._controller.state_summary(status),
+            count_text=count_text,
+            caption=f"回收站项目总数 / 触发阈值 {threshold_items:,}",
+            ratio=ratio,
         )
-        self._rows["threshold"].configure(text=f"{self._controller.config.threshold_items:,}")
+        self._set_row("threshold", f"{threshold_items:,}", tone="text")
 
         last_check = _format_time(scan.queried_at) if scan is not None else "尚未检查"
-        if scan is not None and not scan.is_complete:
+        incomplete = scan is not None and not scan.is_complete
+        if incomplete:
             last_check += "  ⚠ 统计不完整"
-        self._rows["last_check"].configure(text=last_check)
-        self._rows["next_check"].configure(
-            text=f"约 {status.interval_seconds} 秒后" if not self._controller.is_paused() else "已暂停"
+        self._set_row("last_check", last_check, tone="warn" if incomplete else "text")
+        self._set_row(
+            "next_check",
+            (
+                f"约 {self._controller.seconds_until_next_check()} 秒后"
+                if not self._controller.is_paused()
+                else "已暂停"
+            ),
+            tone="text",
         )
 
         last_clean = status.last_clean_result
         if last_clean is None:
-            self._rows["last_clean"].configure(text="尚无清理记录")
+            self._set_row("last_clean", "尚无清理记录", tone="text_muted")
         else:
             outcome = _CLEAN_OUTCOME_TEXT.get(last_clean.outcome, last_clean.outcome.value)
-            self._rows["last_clean"].configure(
-                text=f"{_format_time(last_clean.started_at)}  {outcome}"
-                + (f"（剩余 {last_clean.remaining_items}）" if last_clean.remaining_items else "")
+            self._set_row(
+                "last_clean",
+                f"{_format_time(last_clean.started_at)}  {outcome}"
+                + (f"（剩余 {last_clean.remaining_items}）" if last_clean.remaining_items else ""),
+                tone="ok" if last_clean.succeeded else "danger",
             )
 
         # 读注册表有成本，每 20 次刷新（约 10 秒）才真正查询一次
@@ -398,26 +671,34 @@ class TrayApplication:
             except Exception:
                 logger.debug("读取开机启动状态失败", exc_info=True)
                 self._autostart_cached = False
-        self._rows["autostart"].configure(
-            text="已启用（登录后自动运行）" if self._autostart_cached else "未启用"
+        self._set_row(
+            "autostart",
+            "已启用（登录后自动运行）" if self._autostart_cached else "未启用",
+            tone="ok" if self._autostart_cached else "text_muted",
         )
-        self._rows["last_clean_at"].configure(text=self._controller.last_clean_summary())
-        self._rows["error"].configure(text=status.last_error or "无")
-        self._rows["config"].configure(text=str(self._controller.config_path))
+        self._set_row("last_clean_at", self._controller.last_clean_summary(), tone="text_muted")
+        self._set_row(
+            "error", status.last_error or "无", tone="danger" if status.last_error else "text_muted"
+        )
+        self._set_row("config", str(self._controller.config_path), tone="text_muted")
 
         self._var_auto.set(status.auto_clean_enabled)
-        self._var_dry.set(status.dry_run)
-        self._btn_pause.configure(
-            text="恢复监控" if self._controller.is_paused() else "暂停监控"
-        )
+        self._btn_pause.configure(text="恢复监控" if self._controller.is_paused() else "暂停监控")
 
         self._update_icon(status.state)
         self._notify_changes(status)
 
+    def _set_row(self, key: str, text: str, *, tone: str = "text") -> None:
+        """刷新一行概览：文字 + 语义配色（成功绿 / 失败红 / 提醒橙 / 中性灰）。"""
+        label = self._rows[key]
+        label.configure(text=text)
+        label.set_color(fg=tone)
+
     def _update_icon(self, state: MonitorState) -> None:
-        if not self._icon_ready.is_set():
+        if not self._icon_ready.is_set() or self._icon is None:
             return
-        color = _STATE_COLORS.get(state, "#2E7D32")
+        # 未登记的状态按“正常”处理（保留原色）。
+        color = _STATE_COLORS.get(state)
         if color == self._last_icon_color:
             return
         self._last_icon_color = color
@@ -435,14 +716,17 @@ class TrayApplication:
         elif not status.last_error:
             self._last_error_seen = None
 
-        if status.last_clean_result is not None and status.last_clean_result is not self._last_clean_seen:
+        if (
+            status.last_clean_result is not None
+            and status.last_clean_result is not self._last_clean_seen
+        ):
             self._last_clean_seen = status.last_clean_result
             outcome = status.last_clean_result
             if outcome.succeeded:
                 self._notify("回收站已清空", f"清理了 {outcome.items_before} 个项目")
 
     def _notify(self, title: str, message: str) -> None:
-        if not self._icon_ready.is_set():
+        if not self._icon_ready.is_set() or self._icon is None:
             return
         try:
             self._icon.notify(message, title)
@@ -459,11 +743,14 @@ class TrayApplication:
     def _menu_check_now(self, icon=None, item=None) -> None:
         self._post(self._on_check_now)
 
+    def _menu_settings(self, icon=None, item=None) -> None:
+        self._post(self._on_settings)
+
+    def _menu_cycle_theme(self, icon=None, item=None) -> None:
+        self._post(self._on_cycle_theme)
+
     def _menu_toggle_auto_clean(self, icon=None, item=None) -> None:
         self._post(self._on_toggle_auto_clean)
-
-    def _menu_toggle_dry_run(self, icon=None, item=None) -> None:
-        self._post(self._on_toggle_dry_run)
 
     def _menu_toggle_hotkey(self, icon=None, item=None) -> None:
         self._post(self._on_toggle_hotkey)
@@ -484,6 +771,93 @@ class TrayApplication:
         self._post(self._quit)
 
     # ------------------------------------------------------------------
+    # 自动升级（GitHub 拉取 + 本地信号兜底）
+    # ------------------------------------------------------------------
+
+    def _menu_check_update(self, icon=None, item=None) -> None:
+        """手动触发一次更新检查（忽略节流）。"""
+        self._last_update_check = 0.0
+        self._maybe_check_update(force=True)
+
+    def _menu_install_update(self, icon=None, item=None) -> None:
+        """手动安装已发现的新版本（仅当存在 pending 更新）。"""
+        if self._pending_update is None:
+            self._notify("无需更新", "当前已是最新版本")
+            return
+        self._prepare_and_apply(self._pending_update)
+
+    def _maybe_check_update(self, force: bool = False) -> None:
+        """节流地发起一次更新检查（网络调用在后台线程，不阻塞 UI）。"""
+        if self._update_checking:
+            return
+        now = time.monotonic()
+        interval = updater_module.UPDATE_CHECK_INTERVAL_SECONDS
+        if not force and (now - self._last_update_check) < interval:
+            return
+        self._last_update_check = now
+        self._update_checking = True
+        threading.Thread(target=self._do_update_check, daemon=True).start()
+
+    def _do_update_check(self) -> None:
+        try:
+            result = updater_module.check_for_update(current_version=__version__)
+            self._post(lambda: self._on_update_checked(result))
+        except Exception:  # 检查异常不影响主循环
+            logger.exception("更新检查异常")
+        finally:
+            self._update_checking = False
+
+    def _on_update_checked(self, result) -> None:
+        """主线程处理检查结果。"""
+        if result.status == "error":
+            logger.warning("更新检查失败：%s", result.error)
+            return
+        if result.status == "up_to_date":
+            self._pending_update = None
+            return
+
+        update = result.release if result.release is not None else result.local
+        self._pending_update = update
+        version = update.version
+        if self._controller.config.auto_update_on_signal:
+            logger.info("发现新版本 v%s，开始自动下载并换包", version)
+            if isinstance(update, ReleaseInfo) and update.expected_sha256 is None:
+                self._notify("正在更新", f"v{version} 未提供校验和，已跳过完整性校验")
+            else:
+                self._notify("正在更新", f"v{version} 正在后台下载并安装")
+            self._prepare_and_apply(update)
+        else:
+            logger.info("发现新版本 v%s（自动更新已关闭，请手动安装）", version)
+            self._notify("发现新版本", f"v{version} 可用，请在托盘菜单“安装更新”")
+
+    def _prepare_and_apply(self, update: ReleaseInfo | LocalUpdate) -> None:
+        """后台线程：下载（GitHub）或直接使用（本地信号）并校验，再交回主线程换包。"""
+        threading.Thread(target=self._do_prepare_and_apply, args=(update,), daemon=True).start()
+
+    def _do_prepare_and_apply(self, update: ReleaseInfo | LocalUpdate) -> None:
+        try:
+            if isinstance(update, ReleaseInfo):
+                dest = Path(tempfile.gettempdir()) / f"RecycleBinGuard-{update.version}.exe"
+                updater_module.prepare_release(update, dest, timeout=60.0)
+                local_exe = dest
+            else:  # LocalUpdate：文件已在本地
+                local_exe = update.new_exe
+            self._post(lambda: self._on_ready_to_apply(local_exe))
+        except Exception as exc:  # 准备失败：HOLD，绝不换包
+            message = str(exc)
+            logger.exception("准备更新失败")
+            # 必须在 except 块内把异常信息拷到普通局部变量：
+            # Python 会在 except 结束后删除 exc，lambda 延迟执行时会 NameError。
+            self._post(lambda: self._notify("更新失败", message))
+
+    def _on_ready_to_apply(self, local_exe: Path) -> None:
+        """主线程：执行换包并退出（回调由 __main__ 注入）。"""
+        if self._on_apply_update is not None:
+            self._on_apply_update(local_exe)
+        else:
+            logger.warning("未提供换包回调，无法完成更新")
+
+    # ------------------------------------------------------------------
     # 界面动作（主线程）
     # ------------------------------------------------------------------
 
@@ -498,6 +872,30 @@ class TrayApplication:
     def _on_check_now(self) -> None:
         self._rows["last_check"].configure(text="正在检查…")
         self._controller.request_check()
+
+    def _on_settings(self) -> None:
+        """打开设置对话框；已有对话框时把它提到前台，保证最多一个。"""
+        if self._settings_dialog is not None:
+            try:
+                self._settings_dialog.window.lift()
+                self._settings_dialog.window.focus_force()
+                return
+            except tk.TclError:  # 窗口已被销毁
+                self._settings_dialog = None
+        try:
+            self._settings_dialog = SettingsDialog(
+                self._root, self._controller, self._on_settings_saved, theme=self._theme
+            )
+        except Exception:  # 不静默
+            logger.exception("创建设置对话框失败")
+            messagebox.showerror(APP_NAME, "无法打开设置窗口，详情见日志。", parent=self._root)
+
+    def _on_settings_saved(self) -> None:
+        self._settings_dialog = None
+        # 设置里可能改了皮肤：立刻套用新配置
+        self._theme.set_mode(self._controller.config.theme)
+        self._refresh_theme_button()
+        self._refresh()
 
     def _on_toggle_pause(self) -> None:
         paused = self._controller.toggle_pause()
@@ -539,17 +937,6 @@ class TrayApplication:
             return
         self._on_toggle_auto_clean()
 
-    def _on_toggle_dry_run(self) -> None:
-        enabled = self._controller.toggle_dry_run()
-        logger.info("用户%s试运行模式", "开启" if enabled else "关闭")
-        self._refresh()
-
-    def _on_dry_checkbox(self) -> None:
-        desired = bool(self._var_dry.get())
-        if desired == self._controller.config.dry_run:
-            return
-        self._on_toggle_dry_run()
-
     def _on_toggle_hotkey(self) -> None:
         """开关全局热键（Ctrl + Alt + R）。"""
         enabled = self._controller.toggle_hotkey()
@@ -569,9 +956,7 @@ class TrayApplication:
                 parent=self._root,
             )
         else:
-            messagebox.showwarning(
-                APP_NAME, "快捷方式创建失败，请查看日志。", parent=self._root
-            )
+            messagebox.showwarning(APP_NAME, "快捷方式创建失败，请查看日志。", parent=self._root)
 
     def _on_toggle_autostart(self) -> None:
         try:
@@ -590,17 +975,35 @@ class TrayApplication:
         刻意**不**调用 ``transient(self._root)``：托盘常驻时主窗口是隐藏的，
         transient 会让子窗口跟着隐藏，用户点了菜单却看不到内容。
         """
+        palette = self._theme.palette
         window = tk.Toplevel(self._root)
         window.title(f"{APP_NAME} — {title}")
         window.geometry("760x420")
+        window.configure(bg=palette.canvas)
 
-        text = scrolledtext.ScrolledText(window, wrap="none", font=("Consolas", 9))
+        text = scrolledtext.ScrolledText(
+            window,
+            wrap="none",
+            font=("Consolas", 9),
+            bg=palette.code,
+            fg=palette.code_text,
+            insertbackground=palette.code_text,
+            highlightthickness=0,
+            bd=0,
+        )
         text.pack(fill="both", expand=True)
         text.insert("end", "\n".join(lines) if lines else "（暂无记录）")
         text.configure(state="disabled")
         text.see("end")
 
-        ttk.Label(window, text=footer).pack(anchor="w", padx=6, pady=4)
+        ThemedLabel(
+            window,
+            palette,
+            bg="canvas",
+            fg="text_muted",
+            text=footer,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=4)
         ttk.Button(window, text="关闭", command=window.destroy).pack(pady=(0, 8))
         window.lift()
 
@@ -650,13 +1053,29 @@ class TrayApplication:
                 pass
 
 
-def run_tray(controller: AppController, *, start_minimized: bool = False) -> None:
+def run_tray(
+    controller: AppController,
+    *,
+    start_minimized: bool = False,
+    on_apply_update: Callable[[Path], None] | None = None,
+) -> None:
     """创建并运行托盘应用（阻塞）。
 
     :param start_minimized: 为 ``True`` 时静默驻留托盘（开机自启场景），
         否则启动后立刻显示状态窗口，避免用户找不到程序在哪。
+    :param on_apply_update: 收到并校验新版本后，由主程序提供的“换包并退出”回调；
+        为 ``None`` 时仅提示、不自动换包。
     """
-    TrayApplication(controller, start_minimized=start_minimized).run()
+    TrayApplication(
+        controller, start_minimized=start_minimized, on_apply_update=on_apply_update
+    ).run()
 
 
-__all__ = ["TrayApplication", "create_icon_image", "run_tray", "LABEL_AUTO_ON"]
+__all__ = [
+    "APP_USER_MODEL_ID",
+    "DEFAULT_ICON_COLOR",
+    "LABEL_AUTO_ON",
+    "TrayApplication",
+    "create_icon_image",
+    "run_tray",
+]

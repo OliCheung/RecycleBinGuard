@@ -12,12 +12,13 @@ import pytest
 from recyclebingguard import paths
 from recyclebingguard.__main__ import (
     EXIT_ALREADY_RUNNING,
-    EXIT_CONFIG_ERROR,
     _ensure_std_streams,
+    _load_config_with_recovery,
     _make_emit,
     _open_report,
     main,
 )
+from recyclebingguard.config import Config
 from recyclebingguard.single_instance import SingleInstance
 
 
@@ -83,19 +84,62 @@ def test_init_config_writes_safe_defaults(isolated_home: Path) -> None:
     assert main(["--init-config"]) == 0
 
     text = paths.config_path().read_text(encoding="utf-8")
-    assert '"auto_clean_enabled": false' in text
+    assert '"auto_clean_enabled": true' in text
     assert '"auto_clean_confirmed": false' in text
-    assert '"dry_run": true' in text
+    assert '"auto_update_on_signal": true' in text
 
 
-def test_corrupt_config_returns_error_code(
-    isolated_home: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_corrupt_config_is_backed_up_and_recovered(isolated_home: Path) -> None:
+    """损坏的 config.json 不再阻塞启动：备份原文件、回退默认值并重写。"""
     isolated_home.mkdir(parents=True, exist_ok=True)
     paths.config_path().write_text("{ broken", encoding="utf-8")
 
-    assert main([]) == EXIT_CONFIG_ERROR
-    assert "配置错误" in capsys.readouterr().err
+    config, recovery = _load_config_with_recovery()
+
+    assert recovery is not None
+    assert "默认配置" in recovery
+    assert config == Config()
+    assert json.loads(paths.config_path().read_text(encoding="utf-8")) == config.to_dict()
+
+    backups = list(isolated_home.glob("config.json.bad-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{ broken"
+
+
+def test_healthy_config_is_not_touched(isolated_home: Path) -> None:
+    isolated_home.mkdir(parents=True, exist_ok=True)
+    target = paths.config_path()
+    target.write_text(json.dumps({"threshold_items": 123}), encoding="utf-8")
+
+    config, recovery = _load_config_with_recovery()
+
+    assert recovery is None
+    assert config.threshold_items == 123
+    assert json.loads(target.read_text(encoding="utf-8")) == {"threshold_items": 123}
+
+
+def test_uninstall_purge_removes_only_runtime_files(
+    isolated_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """数据目录现在就是程序目录：--purge 绝不能把目录本身删掉。"""
+    isolated_home.mkdir(parents=True, exist_ok=True)
+    keep = isolated_home / "keep.txt"
+    keep.write_text("data", encoding="utf-8")
+    paths.config_path().write_text("{}", encoding="utf-8")
+    paths.clean_history_path().write_text("[]", encoding="utf-8")
+    paths.logs_dir().mkdir(parents=True, exist_ok=True)
+    (paths.logs_dir() / "old.log").write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr("recyclebingguard.autostart.disable", lambda *a, **k: None)
+    monkeypatch.setattr("recyclebingguard.shortcuts.uninstall_shortcuts", lambda: [])
+
+    assert main(["--uninstall", "--purge"]) == 0
+
+    assert isolated_home.exists()
+    assert keep.exists()
+    assert not paths.config_path().exists()
+    assert not paths.clean_history_path().exists()
+    assert not paths.logs_dir().exists()
 
 
 def test_second_instance_wakes_existing_one(
@@ -112,8 +156,8 @@ def test_second_instance_wakes_existing_one(
     try:
         assert not paths.wake_request_path().exists()
         assert main([]) == EXIT_ALREADY_RUNNING
-        assert paths.wake_request_path().exists()   # 留下了唤醒请求
-        assert warnings == []                       # 不再弹提示
+        assert paths.wake_request_path().exists()  # 留下了唤醒请求
+        assert warnings == []  # 不再弹提示
     finally:
         holder.release()
 
@@ -187,4 +231,4 @@ def test_check_once_with_report_writes_file(
     text = target.read_text(encoding="utf-8")
     assert "项目总数" in text
     assert "统计完整" in text
-    assert "项目总数" in capsys.readouterr().out   # 有控制台时仍然打印
+    assert "项目总数" in capsys.readouterr().out  # 有控制台时仍然打印

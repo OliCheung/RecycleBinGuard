@@ -12,7 +12,11 @@ from __future__ import annotations
 import ctypes
 import os
 import threading
-from typing import Callable
+from collections.abc import Callable
+
+from .logging_setup import get_logger
+
+logger = get_logger()
 
 #: 热键消息。
 WM_HOTKEY = 0x0312
@@ -105,7 +109,12 @@ class HotkeyListener:
         ]
         user32.RegisterHotKey.restype = ctypes.c_int
         user32.UnregisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        user32.GetMessageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+        user32.GetMessageW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        ]
         user32.GetMessageW.restype = ctypes.c_int
 
         self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
@@ -121,12 +130,12 @@ class HotkeyListener:
                 ("pt_y", ctypes.c_long),
             ]
 
-        ok = bool(
-            user32.RegisterHotKey(None, _HOTKEY_ID, self._modifiers, self._virtual_key)
-        )
+        ok = bool(user32.RegisterHotKey(None, _HOTKEY_ID, self._modifiers, self._virtual_key))
         self._registered = ok
         if not ok:
-            self._error = f"RegisterHotKey 失败（可能被其它程序占用），错误码 {ctypes.get_last_error()}"
+            self._error = (
+                f"RegisterHotKey 失败（可能被其它程序占用），错误码 {ctypes.get_last_error()}"
+            )
         self._ready.set()
         if not ok:
             return
@@ -137,8 +146,8 @@ class HotkeyListener:
                 if msg.message == WM_HOTKEY and msg.wParam == _HOTKEY_ID:
                     try:
                         self._callback()
-                    except Exception:  # 回调异常不能终止消息循环
-                        pass
+                    except Exception:  # 回调异常不能终止消息循环，但必须留痕
+                        logger.exception("全局热键回调抛出异常")
         finally:
             user32.UnregisterHotKey(None, _HOTKEY_ID)
             self._registered = False

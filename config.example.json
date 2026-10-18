@@ -1,13 +1,17 @@
 {
   "threshold_items": 10000,
-  "poll_interval_seconds": 180,
-  "auto_clean_enabled": false,
+  "threshold_size_bytes": 0,
+  "poll_interval_seconds": 600,
+  "auto_clean_enabled": true,
   "auto_clean_confirmed": false,
-  "dry_run": true,
+  "auto_update_on_signal": true,
   "confirm_before_clean": true,
   "confirmation_timeout_seconds": 10,
   "failure_backoff_seconds": 300,
+  "excluded_roots": [],
   "start_on_login": false,
+  "hotkey_enabled": true,
+  "theme": "auto",
   "log_max_bytes": 1048576,
   "log_backup_count": 5
 }

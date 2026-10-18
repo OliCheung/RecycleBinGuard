@@ -48,9 +48,7 @@ def _known_folder(value_name: str) -> Path | None:
         return None
     import winreg
 
-    key_path = (
-        r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
-    )
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_READ) as key:
             value, _ = winreg.QueryValueEx(key, value_name)

@@ -42,14 +42,14 @@ else:  # pragma: no cover - 平台分支
 
     def _try_lock(handle: int) -> bool:
         try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
             return True
         except OSError:
             return False
 
     def _unlock(handle: int) -> None:
         try:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            fcntl.flock(handle, fcntl.LOCK_UN)  # type: ignore[attr-defined]
         except OSError:
             pass
 
@@ -105,7 +105,7 @@ class SingleInstance:
             pass
         logger.info("已释放单实例锁")
 
-    def __enter__(self) -> "SingleInstance":
+    def __enter__(self) -> SingleInstance:
         if not self.acquire():
             raise RuntimeError("已有 RecycleBinGuard 实例正在运行")
         return self

@@ -16,8 +16,10 @@ from recyclebingguard.interfaces import (
     CleanOutcome,
     CleanResult,
     MonitorState,
-    RecycleBinMonitor as RecycleBinMonitorProtocol,
     ScanResult,
+)
+from recyclebingguard.interfaces import (
+    RecycleBinMonitor as RecycleBinMonitorProtocol,
 )
 from recyclebingguard.recycle_bin_monitor import MonitorStatus, RecycleBinMonitor
 
@@ -44,7 +46,11 @@ def bad_scan(items: int, failed: tuple[str, ...] = ("D:\\",)) -> ScanResult:
 
 
 def clean(outcome: CleanOutcome, remaining: int | None = None) -> CleanResult:
-    return CleanResult(outcome=outcome, remaining_items=remaining, error=None if outcome is CleanOutcome.SUCCESS else "模拟失败")
+    return CleanResult(
+        outcome=outcome,
+        remaining_items=remaining,
+        error=None if outcome is CleanOutcome.SUCCESS else "模拟失败",
+    )
 
 
 class FakeBinService:
@@ -55,6 +61,7 @@ class FakeBinService:
         self.default_empty: CleanResult = CleanResult(outcome=CleanOutcome.SUCCESS)
         self.scan_calls = 0
         self.empty_calls = 0
+        self.empty_verified_scan: ScanResult | None = None
         self.empty_gate: threading.Event | None = None
         self.empty_started = threading.Event()
 
@@ -64,8 +71,9 @@ class FakeBinService:
             return self.scan_queue.pop(0)
         return self.default_scan
 
-    def empty(self) -> CleanResult:
+    def empty(self, *, verified_scan: ScanResult | None = None) -> CleanResult:
         self.empty_calls += 1
+        self.empty_verified_scan = verified_scan
         self.empty_started.set()
         if self.empty_gate is not None:
             self.empty_gate.wait(timeout=5)
@@ -92,7 +100,6 @@ def make_config(**overrides) -> Config:
         threshold_items=THRESHOLD,
         poll_interval_seconds=180,
         auto_clean_enabled=True,
-        dry_run=False,
         confirm_before_clean=False,
         failure_backoff_seconds=BACKOFF,
     )
@@ -137,6 +144,55 @@ def test_second_check_below_threshold_cancels_clean() -> None:
     assert monitor.state is MonitorState.IDLE
 
 
+def test_recheck_result_is_reused_by_clean() -> None:
+    """复核结果直接交给清空流程，避免清空前再扫一遍。"""
+    monitor, service, _ = make_monitor()
+    service.default_scan = ok_scan(10000)
+
+    monitor.tick()
+
+    assert service.empty_calls == 1
+    assert service.empty_verified_scan is not None
+    assert service.empty_verified_scan.total_items == 10000
+
+
+def test_size_threshold_triggers_without_item_threshold() -> None:
+    monitor, service, _ = make_monitor(threshold_size_bytes=5 * 1024**3)
+    service.default_scan = ScanResult(
+        total_items=1, total_size_bytes=5 * 1024**3, scanned_roots=("C:\\",)
+    )
+
+    monitor.tick()
+
+    assert service.empty_calls == 1
+    assert monitor.status().threshold_hits == 1
+
+
+def test_seconds_until_next_check_counts_down() -> None:
+    monitor, service, clock = make_monitor()
+    service.default_scan = ok_scan(0)
+
+    assert monitor.seconds_until_next_check() == 180  # 尚未检查
+
+    monitor.tick()
+    assert monitor.seconds_until_next_check() == 180  # 刚检查完
+
+    clock.advance(60)
+    assert monitor.seconds_until_next_check() == 120
+
+
+def test_seconds_until_next_check_reports_backoff() -> None:
+    monitor, service, clock = make_monitor()
+    service.default_scan = ok_scan(10000)
+    service.default_empty = CleanResult(outcome=CleanOutcome.FAILED, error="模拟失败")
+
+    monitor.tick()  # 清理失败 -> 进入退避
+
+    assert monitor.seconds_until_next_check() == BACKOFF
+    clock.advance(100)
+    assert monitor.seconds_until_next_check() == BACKOFF - 100
+
+
 def test_second_check_incomplete_cancels_clean() -> None:
     monitor, service, _ = make_monitor()
     service.scan_queue = [ok_scan(10000), bad_scan(10000)]
@@ -164,7 +220,9 @@ def test_incomplete_scan_does_not_trigger() -> None:
 
 def test_scan_error_does_not_trigger() -> None:
     monitor, service, _ = make_monitor()
-    service.default_scan = ScanResult(total_items=50000, total_size_bytes=0, error="未枚举到固定磁盘")
+    service.default_scan = ScanResult(
+        total_items=50000, total_size_bytes=0, error="未枚举到固定磁盘"
+    )
 
     monitor.tick()
 
@@ -185,28 +243,6 @@ def test_auto_clean_disabled_only_records() -> None:
     assert service.empty_calls == 0
     assert monitor.status().threshold_hits == 1
     assert monitor.state is MonitorState.IDLE
-
-
-def test_dry_run_never_calls_empty() -> None:
-    monitor, service, _ = make_monitor(dry_run=True)
-    service.default_scan = ok_scan(50000)
-
-    monitor.tick()
-
-    assert service.empty_calls == 0
-    assert monitor.status().dry_run_hits == 1
-    assert monitor.state is MonitorState.IDLE
-
-
-def test_dry_run_takes_precedence_over_enabled() -> None:
-    monitor, service, _ = make_monitor(auto_clean_enabled=True, dry_run=True)
-    service.default_scan = ok_scan(50000)
-
-    for _ in range(3):
-        monitor.tick()
-
-    assert service.empty_calls == 0
-    assert monitor.status().dry_run_hits == 3
 
 
 def test_disabling_auto_clean_before_tick_blocks_clean() -> None:
@@ -245,7 +281,7 @@ def test_pause_prevents_checks_and_cleaning() -> None:
     state = monitor.tick()
 
     assert state is MonitorState.PAUSED
-    assert service.scan_calls == 0     # 暂停时连统计都不做
+    assert service.scan_calls == 0  # 暂停时连统计都不做
     assert service.empty_calls == 0
 
     monitor.resume()
@@ -334,7 +370,7 @@ def test_service_exception_is_not_swallowed() -> None:
     monitor, service, _ = make_monitor()
     service.default_scan = ok_scan(50000)
 
-    def boom() -> CleanResult:
+    def boom(*args: object, **kwargs: object) -> CleanResult:
         raise RuntimeError("explode")
 
     service.empty = boom  # type: ignore[method-assign]
@@ -353,7 +389,7 @@ def test_no_infinite_retry_in_single_round() -> None:
 
     monitor.tick()
 
-    assert service.empty_calls == 1      # 同一轮只清空一次
+    assert service.empty_calls == 1  # 同一轮只清空一次
 
 
 # --------------------------------------------------------------------------
@@ -374,7 +410,7 @@ def test_success_rescans_and_records_result() -> None:
     assert status.last_clean_result is not None
     assert status.last_clean_result.outcome is CleanOutcome.SUCCESS
     assert status.last_scan is not None
-    assert status.last_scan.total_items == 0    # 清理后已重新统计
+    assert status.last_scan.total_items == 0  # 清理后已重新统计
     assert status.last_error is None
 
 
@@ -435,7 +471,7 @@ def test_start_is_idempotent() -> None:
 
     monitor.start()
     thread = monitor._thread  # noqa: SLF001
-    monitor.start()           # 重复启动不应新建线程
+    monitor.start()  # 重复启动不应新建线程
     assert monitor._thread is thread  # noqa: SLF001
 
     monitor.stop()
@@ -486,7 +522,6 @@ def test_status_snapshot_defaults() -> None:
     assert isinstance(status, MonitorStatus)
     assert status.state is MonitorState.IDLE
     assert status.auto_clean_enabled is True
-    assert status.dry_run is False
     assert status.interval_seconds == 180
     assert status.last_scan is None
     assert status.last_clean_result is None

@@ -1,10 +1,10 @@
-"""构建 RecycleBinGuard 独立 EXE（目录式）。
+"""构建 RecycleBinGuard 独立 EXE（单文件 onefile）。
 
 步骤：
 
 1. 运行单元测试（失败即中止）；
 2. 生成 ``packaging/recyclebingguard.ico``；
-3. 调用 PyInstaller 按 ``packaging/RecycleBinGuard.spec`` 构建；
+3. 调用 PyInstaller 按 ``packaging/RecycleBinGuard.spec`` 构建（单文件）；
 4. 冒烟验证 ``--version``。
 
 用法::
@@ -22,7 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SPEC = ROOT / "packaging" / "RecycleBinGuard.spec"
-EXE = ROOT / "dist" / "RecycleBinGuard" / "RecycleBinGuard.exe"
+EXE = ROOT / "dist" / "RecycleBinGuard.exe"
 
 
 def run(step: str, args: list[str]) -> None:

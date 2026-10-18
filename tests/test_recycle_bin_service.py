@@ -29,9 +29,9 @@ from recyclebingguard.recycle_bin_service import (
     hresult_ok,
 )
 
-E_FAIL = -2147467259            # 0x80004005
-E_UNEXPECTED = -2147418113      # 0x8000FFFF
-E_ACCESSDENIED = -2147024891    # 0x80070005
+E_FAIL = -2147467259  # 0x80004005
+E_UNEXPECTED = -2147418113  # 0x8000FFFF
+E_ACCESSDENIED = -2147024891  # 0x80070005
 
 
 class FakeShellApi:
@@ -155,6 +155,75 @@ def test_scan_excludes_removable_network_and_optical_drives() -> None:
     assert "Z:\\" not in api.query_calls
 
 
+def test_scan_excludes_configured_roots() -> None:
+    api = FakeShellApi([("C:\\", DriveKind.FIXED), ("D:\\", DriveKind.FIXED)])
+    api.set_count("C:\\", 10)
+    api.set_count("D:\\", 999999)
+
+    service = RecycleBinService(api, excluded_roots=["d:"])
+    result = service.scan()
+
+    assert result.scanned_roots == ("C:\\",)
+    assert result.total_items == 10
+    assert result.is_complete is True
+    assert "D:\\" not in api.query_calls
+
+
+def test_set_excluded_roots_normalizes_and_ignores_junk() -> None:
+    api = FakeShellApi([("C:\\", DriveKind.FIXED)])
+    service = RecycleBinService(api)
+
+    assert service.excluded_roots == frozenset()
+    service.set_excluded_roots(["d:/", "not a drive", "C:"])
+    assert service.excluded_roots == frozenset({"C:\\", "D:\\"})
+
+    service.set_excluded_roots([])
+    assert service.excluded_roots == frozenset()
+
+
+def test_empty_never_touches_excluded_roots() -> None:
+    api = FakeShellApi([("C:\\", DriveKind.FIXED), ("D:\\", DriveKind.FIXED)])
+    api.set_count("C:\\", 5, 50)
+    api.set_count("D:\\", 5, 50)
+    api.on_empty = lambda root: api.set_count(root, 0, 0)
+
+    service = RecycleBinService(api, excluded_roots=["D:\\"])
+    result = service.empty()
+
+    assert result.outcome is CleanOutcome.SUCCESS
+    assert [root for root, _flags in api.empty_calls] == ["C:\\"]
+
+
+def test_empty_reuses_verified_scan_instead_of_rescanning() -> None:
+    api = FakeShellApi([("C:\\", DriveKind.FIXED)])
+    api.set_count("C:\\", 3, 30)
+    api.on_empty = lambda root: api.set_count(root, 0, 0)
+
+    service = make_service(api)
+    verified = service.scan()
+    queries_before = len(api.query_calls)
+
+    result = service.empty(verified_scan=verified)
+
+    assert result.outcome is CleanOutcome.SUCCESS
+    # 清空前不再重复统计：只多出“清空后复核”的一次查询
+    assert len(api.query_calls) == queries_before + 1
+
+
+def test_empty_refuses_incomplete_verified_scan() -> None:
+    api = FakeShellApi([("C:\\", DriveKind.FIXED), ("D:\\", DriveKind.FIXED)])
+    api.set_count("C:\\", 3)
+    api.set_error("D:\\", E_FAIL)
+
+    service = make_service(api)
+    verified = service.scan()
+
+    result = service.empty(verified_scan=verified)
+
+    assert result.outcome is CleanOutcome.INCOMPLETE
+    assert api.empty_calls == []
+
+
 def test_scan_marks_incomplete_when_one_disk_fails() -> None:
     api = FakeShellApi([("C:\\", DriveKind.FIXED), ("D:\\", DriveKind.FIXED)])
     api.set_count("C:\\", 100)
@@ -248,7 +317,7 @@ def test_empty_refuses_when_pre_scan_incomplete() -> None:
     result = make_service(api).empty()
 
     assert result.outcome is CleanOutcome.INCOMPLETE
-    assert api.empty_calls == []          # 关键：清空 API 未被调用
+    assert api.empty_calls == []  # 关键：清空 API 未被调用
     assert result.items_before is None
     assert result.items_after is None
     assert "复核统计不完整" in (result.error or "")
@@ -296,7 +365,7 @@ def test_empty_returns_partial_without_retrying() -> None:
     assert result.outcome is CleanOutcome.PARTIAL
     assert result.remaining_items == 150
     assert result.items_after == 150
-    assert len(api.empty_calls) == 2       # 只清空一轮，不无限重试
+    assert len(api.empty_calls) == 2  # 只清空一轮，不无限重试
 
 
 def test_empty_returns_failed_when_all_calls_fail() -> None:
@@ -336,7 +405,7 @@ def test_empty_success_even_if_a_call_errored_but_bin_is_empty() -> None:
 
     result = make_service(api).empty()
 
-    assert result.outcome is CleanOutcome.SUCCESS   # 复核为最终依据
+    assert result.outcome is CleanOutcome.SUCCESS  # 复核为最终依据
     assert result.hresult == E_UNEXPECTED
 
 

@@ -7,19 +7,36 @@ from pathlib import Path
 
 import pytest
 
-from recyclebingguard.config import Config, ConfigError, load_config, save_config
+from recyclebingguard.config import (
+    DEFAULTS,
+    Config,
+    ConfigError,
+    load_config,
+    save_config,
+)
 
 
 def test_defaults_are_safe() -> None:
     cfg = Config()
     assert cfg.threshold_items == 10000
-    assert cfg.poll_interval_seconds == 180
-    assert cfg.auto_clean_enabled is False
+    assert cfg.threshold_size_bytes == 0
+    assert cfg.poll_interval_seconds == 600
+    assert cfg.auto_clean_enabled is True
     assert cfg.auto_clean_confirmed is False
-    assert cfg.dry_run is True
     assert cfg.failure_backoff_seconds == 300
+    assert cfg.excluded_roots == []
     assert cfg.start_on_login is False
     assert cfg.hotkey_enabled is True
+
+
+def test_to_dict_equals_defaults() -> None:
+    assert Config().to_dict() == DEFAULTS
+
+
+def test_config_example_matches_defaults() -> None:
+    """config.example.json 必须与默认值完全一致，避免文档漂移。"""
+    example = Path(__file__).resolve().parents[1] / "config.example.json"
+    assert json.loads(example.read_text(encoding="utf-8")) == DEFAULTS
 
 
 def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
@@ -29,7 +46,7 @@ def test_load_missing_file_returns_defaults(tmp_path: Path) -> None:
 
 def test_save_then_load_roundtrip(tmp_path: Path) -> None:
     target = tmp_path / "config.json"
-    original = Config(threshold_items=5000, auto_clean_enabled=True, dry_run=False)
+    original = Config(threshold_items=5000, auto_clean_enabled=True)
     save_config(original, target)
 
     assert json.loads(target.read_text(encoding="utf-8"))["threshold_items"] == 5000
@@ -47,8 +64,15 @@ def test_partial_json_fills_missing_with_defaults(tmp_path: Path) -> None:
     target.write_text(json.dumps({"threshold_items": 42}), encoding="utf-8")
     cfg = load_config(target)
     assert cfg.threshold_items == 42
-    assert cfg.dry_run is True
-    assert cfg.auto_clean_enabled is False
+    assert cfg.auto_clean_enabled is True
+
+
+def test_bom_prefixed_config_is_accepted(tmp_path: Path) -> None:
+    """记事本 / PowerShell 5.1 会写入 UTF-8 BOM，不能因此判为损坏。"""
+    target = tmp_path / "config.json"
+    target.write_bytes(b"\xef\xbb\xbf" + json.dumps({"threshold_items": 321}).encode("utf-8"))
+
+    assert load_config(target).threshold_items == 321
 
 
 def test_unknown_keys_are_ignored(tmp_path: Path) -> None:
@@ -80,7 +104,6 @@ def test_non_object_root_raises() -> None:
         ({"log_backup_count": -1}, "log_backup_count"),
         ({"threshold_items": 1.5}, "threshold_items"),
         ({"threshold_items": True}, "threshold_items"),
-        ({"dry_run": "yes"}, "dry_run"),
         ({"auto_clean_enabled": 1}, "auto_clean_enabled"),
     ],
 )
@@ -99,17 +122,43 @@ def test_validate_rejects_hand_built_invalid_config() -> None:
 
 
 def test_to_dict_matches_defaults_keys() -> None:
-    assert set(Config().to_dict()) == {
-        "threshold_items",
-        "poll_interval_seconds",
-        "auto_clean_enabled",
-        "auto_clean_confirmed",
-        "dry_run",
-        "confirm_before_clean",
-        "confirmation_timeout_seconds",
-        "failure_backoff_seconds",
-        "start_on_login",
-        "hotkey_enabled",
-        "log_max_bytes",
-        "log_backup_count",
-    }
+    assert set(Config().to_dict()) == set(DEFAULTS)
+
+
+@pytest.mark.parametrize(
+    ("raw", "normalized"),
+    [
+        ("d:", "D:\\"),
+        ("D:/", "D:\\"),
+        ("D:\\", "D:\\"),
+        (" e: ", "E:\\"),
+    ],
+)
+def test_excluded_roots_are_normalized(raw: str, normalized: str) -> None:
+    cfg = Config.from_dict({"excluded_roots": [raw]})
+    assert cfg.excluded_roots == [normalized]
+
+
+def test_excluded_roots_deduplicates() -> None:
+    cfg = Config.from_dict({"excluded_roots": ["d:", "D:\\", "D:/"]})
+    assert cfg.excluded_roots == ["D:\\"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"excluded_roots": "C:"},
+        {"excluded_roots": [123]},
+        {"excluded_roots": ["not a drive"]},
+        {"excluded_roots": ["\\\\server\\share"]},
+    ],
+)
+def test_invalid_excluded_roots_rejected(payload: dict) -> None:
+    with pytest.raises(ConfigError, match="excluded_roots"):
+        Config.from_dict(payload)
+
+
+def test_threshold_size_bytes_bounds() -> None:
+    assert Config.from_dict({"threshold_size_bytes": 0}).threshold_size_bytes == 0
+    with pytest.raises(ConfigError, match="threshold_size_bytes"):
+        Config.from_dict({"threshold_size_bytes": -1})

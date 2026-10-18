@@ -18,7 +18,7 @@
 ============ ==================
 磁盘类型     策略
 ============ ==================
-固定磁盘     纳入统计与清空
+固定磁盘     纳入统计与清空（可用 excluded_roots 排除）
 可移动盘     不统计
 网络盘       不扫描
 光驱/内存盘  不统计
@@ -31,6 +31,7 @@ from __future__ import annotations
 import ctypes
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol, runtime_checkable
@@ -42,6 +43,7 @@ from .interfaces import (
     DiskScanResult,
     DriveKind,
     ScanResult,
+    normalize_root,
 )
 from .logging_setup import get_logger
 
@@ -180,9 +182,9 @@ class WindowsShellApi:
         self._shell32.SHQueryRecycleBinW.restype = ctypes.c_int32
 
         self._shell32.SHEmptyRecycleBinW.argtypes = [
-            ctypes.c_void_p,   # HWND，None 表示无属主窗口
+            ctypes.c_void_p,  # HWND，None 表示无属主窗口
             ctypes.c_wchar_p,  # pszRootPath，None 表示所有驱动器
-            ctypes.c_uint32,   # dwFlags
+            ctypes.c_uint32,  # dwFlags
         ]
         self._shell32.SHEmptyRecycleBinW.restype = ctypes.c_int32
 
@@ -261,10 +263,29 @@ class RecycleBinService:
         *,
         included_kinds: frozenset[DriveKind] = INCLUDED_DRIVE_KINDS,
         empty_flags: int = DEFAULT_EMPTY_FLAGS,
+        excluded_roots: Iterable[str] = (),
     ) -> None:
         self._api: ShellApi = api if api is not None else WindowsShellApi()
         self._included_kinds = included_kinds
         self._empty_flags = empty_flags
+        self._excluded_roots: frozenset[str] = frozenset()
+        self.set_excluded_roots(excluded_roots)
+
+    # -- 纳入范围 --
+
+    @property
+    def excluded_roots(self) -> frozenset[str]:
+        """当前被排除在统计与清空之外的盘符（形如 ``D:\\``）。"""
+        return self._excluded_roots
+
+    def set_excluded_roots(self, roots: Iterable[str]) -> None:
+        """更新排除盘符（容错：非法项被忽略）。"""
+        self._excluded_roots = frozenset(
+            root for root in (normalize_root(value) for value in roots) if root
+        )
+
+    def _is_included(self, root: str, kind: DriveKind) -> bool:
+        return kind in self._included_kinds and normalize_root(root) not in self._excluded_roots
 
     # -- 只读统计 --
 
@@ -279,12 +300,8 @@ class RecycleBinService:
         固定磁盘时，返回结果的 :attr:`ScanResult.is_complete` 为 ``False``。
         """
         drives = self._api.iter_drives()
-        included = [
-            (root, kind) for root, kind in drives if kind in self._included_kinds
-        ]
-        skipped = [
-            (root, kind) for root, kind in drives if kind not in self._included_kinds
-        ]
+        included = [(root, kind) for root, kind in drives if self._is_included(root, kind)]
+        skipped = [(root, kind) for root, kind in drives if not self._is_included(root, kind)]
 
         disks: list[DiskScanResult] = []
         total_items = 0
@@ -352,7 +369,7 @@ class RecycleBinService:
 
     # -- 清空 --
 
-    def empty(self) -> CleanResult:
+    def empty(self, *, verified_scan: ScanResult | None = None) -> CleanResult:
         """清空回收站。
 
         流程：**清空前复核** → 对每个已纳入统计的固定磁盘调用
@@ -360,6 +377,9 @@ class RecycleBinService:
 
         清空范围刻意限定为“已纳入统计的本机固定磁盘”，逐盘调用而非传
         ``NULL``（``NULL`` 会清空所有驱动器，包括本次未统计的可移动盘与网络盘）。
+
+        :param verified_scan: 调用方刚做过的清空前复核结果。完整时直接复用，
+            避免重复扫描；不完整或未提供时自行扫描。安全性不变（不完整照样拒绝）。
 
         结果判定：
 
@@ -376,17 +396,13 @@ class RecycleBinService:
         def elapsed() -> float:
             return round(time.perf_counter() - started_perf, 6)
 
-        # 1) 清空前二次核验
-        pre = self.scan()
+        # 1) 清空前二次核验（可复用调用方刚做的复核，避免多扫一遍）
+        pre = verified_scan if verified_scan is not None else self.scan()
         if not pre.is_complete or not pre.scanned_roots:
             message = (
                 "清空前复核统计不完整，已拒绝清空"
                 + (f"：{pre.error}" if pre.error else "")
-                + (
-                    f"（失败磁盘：{list(pre.failed_roots)}）"
-                    if pre.failed_roots
-                    else ""
-                )
+                + (f"（失败磁盘：{list(pre.failed_roots)}）" if pre.failed_roots else "")
             )
             logger.error("%s；清空 API 未被调用", message)
             return CleanResult(
@@ -426,11 +442,7 @@ class RecycleBinService:
             message = (
                 "清空后复核统计不完整，无法确认清理结果"
                 + (f"：{post.error}" if post.error else "")
-                + (
-                    f"（失败磁盘：{list(post.failed_roots)}）"
-                    if post.failed_roots
-                    else ""
-                )
+                + (f"（失败磁盘：{list(post.failed_roots)}）" if post.failed_roots else "")
             )
             logger.error("%s；HRESULT=%s", message, hresult_message(aggregate_hresult))
             return CleanResult(
@@ -450,9 +462,7 @@ class RecycleBinService:
                     "回收站已清空，但存在失败的清空调用：%s",
                     [(root, hresult_message(hr)) for root, hr in failed_calls],
                 )
-            logger.info(
-                "回收站清空成功：清理前=%d 耗时=%.3fs", pre.total_items, elapsed()
-            )
+            logger.info("回收站清空成功：清理前=%d 耗时=%.3fs", pre.total_items, elapsed())
             return CleanResult(
                 outcome=CleanOutcome.SUCCESS,
                 hresult=aggregate_hresult,

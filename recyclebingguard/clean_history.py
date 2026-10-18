@@ -7,12 +7,12 @@
 - :class:`MonitorStatus.last_clean_result` 只存在于内存，程序重启即丢失。
 
 本模块把**真正调用过清空 API** 的清理（含成功 / 部分 / 失败）追加写入
-``%LOCALAPPDATA%\\RecycleBinGuard\\clean_history.json``，程序重启后仍可查询。
+``clean_history.json``（与配置、日志同目录，默认即程序所在目录），程序重启后仍可查询。
 
 安全与稳健约定：
 
 - 只记录时间、数量、结果类型与错误信息，**不记录任何文件名或文件内容**；
-- 试运行（dry-run）、取消确认、复核未通过等“没有调用清空 API”的情况**不写入**；
+- 取消确认、复核未通过、自动清理关闭或暂停等“没有调用清空 API”的情况**不写入**；
 - 文件损坏时返回空历史并记日志，**不抛异常、不影响监控**；
 - 写入采用“先写 .tmp 再 replace”的原子方式，最多保留 :data:`MAX_RECORDS` 条。
 """
@@ -85,7 +85,7 @@ class CleanRecord:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CleanRecord":
+    def from_dict(cls, data: dict[str, Any]) -> CleanRecord:
         try:
             finished_at = datetime.fromisoformat(str(data["finished_at"]))
         except (KeyError, TypeError, ValueError) as exc:
@@ -145,7 +145,8 @@ class CleanHistory:
             if not self._path.exists():
                 return []
             try:
-                raw = json.loads(self._path.read_text(encoding="utf-8"))
+                # utf-8-sig：容忍带 BOM 的文件（记事本 / PowerShell 5.1 常见）。
+                raw = json.loads(self._path.read_text(encoding="utf-8-sig"))
             except (OSError, json.JSONDecodeError) as exc:
                 logger.error("清理历史读取失败（按空历史处理）：%s（%s）", self._path, exc)
                 return []
@@ -185,11 +186,14 @@ class CleanHistory:
             records.sort(key=lambda r: r.finished_at, reverse=True)
             records = records[:MAX_RECORDS]
 
-            payload = json.dumps(
-                {"version": HISTORY_VERSION, "records": [r.to_dict() for r in records]},
-                ensure_ascii=False,
-                indent=2,
-            ) + "\n"
+            payload = (
+                json.dumps(
+                    {"version": HISTORY_VERSION, "records": [r.to_dict() for r in records]},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n"
+            )
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._path.with_suffix(self._path.suffix + ".tmp")

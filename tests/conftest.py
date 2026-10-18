@@ -1,7 +1,7 @@
 """pytest 共享夹具。
 
 所有涉及文件系统的测试都必须使用 :func:`isolated_home`，
-避免读写开发者真实用户数据目录（``%LOCALAPPDATA%\\RecycleBinGuard``）。
+避免读写开发者真实的程序目录（默认数据目录即程序 / 项目目录）。
 """
 
 from __future__ import annotations
@@ -58,13 +58,11 @@ def _no_real_dialogs(monkeypatch: pytest.MonkeyPatch):
 def _isolate_clean_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """把清理历史文件重定向到临时目录。
 
-    监控器默认会往 ``%LOCALAPPDATA%\\RecycleBinGuard\\clean_history.json``
-    写清理记录；不隔离的话，跑一次测试就会污染开发者真实的应用数据目录。
+    监控器默认会往程序目录下的 ``clean_history.json`` 写清理记录；
+    不隔离的话，跑一次测试就会污染开发者真实的数据目录。
     """
     target = tmp_path / "clean_history.json"
-    monkeypatch.setattr(
-        "recyclebingguard.paths.clean_history_path", lambda: target
-    )
+    monkeypatch.setattr("recyclebingguard.paths.clean_history_path", lambda: target)
     return target
 
 

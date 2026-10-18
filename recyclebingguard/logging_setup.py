@@ -1,6 +1,6 @@
 """轮转日志配置。
 
-日志写入 ``%LOCALAPPDATA%\\RecycleBinGuard\\logs\\``，使用
+日志写入程序目录下的 ``logs/``，使用
 :class:`logging.handlers.RotatingFileHandler` 限制单文件大小与历史份数。
 
 日志只记录时间、阈值、统计结果、清理结果与错误，**不记录文件内容**。
@@ -26,6 +26,18 @@ def get_logger() -> logging.Logger:
     return logging.getLogger(LOGGER_NAME)
 
 
+def shutdown_logging() -> None:
+    """移除并关闭本模块添加的 handler（卸载 / 删除日志目录前必须调用）。
+
+    Windows 上若日志文件仍被打开，删除 ``logs/`` 会失败，因此 ``--purge``
+    前必须先释放句柄。
+    """
+    logger = logging.getLogger(LOGGER_NAME)
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+
+
 def setup_logging(config: Config, *, to_console: bool = False) -> logging.Logger:
     """根据配置初始化日志，返回 logger。
 
@@ -38,9 +50,7 @@ def setup_logging(config: Config, *, to_console: bool = False) -> logging.Logger
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
-    for handler in list(logger.handlers):
-        logger.removeHandler(handler)
-        handler.close()
+    shutdown_logging()
 
     paths.ensure_app_home()
     log_dir = paths.logs_dir()

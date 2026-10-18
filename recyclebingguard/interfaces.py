@@ -18,21 +18,36 @@ T2（:mod:`recyclebingguard.recycle_bin_monitor`）中提供。
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
+#: 合法盘符根，形如 ``D:``（不含结尾反斜杠）。
+_DRIVE_ROOT_RE = re.compile(r"^[A-Za-z]:$")
+
+
+def normalize_root(value: str) -> str:
+    """把盘符统一成 ``D:\\`` 形式；非法输入返回空串。
+
+    接受 ``d:`` / ``D:/`` / ``D:\\`` 等写法，便于配置文件与界面容错。
+    """
+    text = value.strip().replace("/", "\\").rstrip("\\").upper()
+    if _DRIVE_ROOT_RE.match(text):
+        return f"{text}\\"
+    return ""
+
 
 class DriveKind(Enum):
     """磁盘类型（对应 Windows ``GetDriveTypeW`` 的语义）。"""
 
-    FIXED = "fixed"          # 本机固定磁盘，第一版唯一纳入统计的类型
+    FIXED = "fixed"  # 本机固定磁盘，第一版唯一纳入统计的类型
     REMOVABLE = "removable"  # 可移动盘：第一版不统计
-    NETWORK = "network"      # 网络盘：第一版不扫描
-    CDROM = "cdrom"          # 光驱：第一版不统计
-    RAMDISK = "ramdisk"      # 内存盘：第一版不统计
-    UNKNOWN = "unknown"      # 未知/未挂载：不统计
+    NETWORK = "network"  # 网络盘：第一版不扫描
+    CDROM = "cdrom"  # 光驱：第一版不统计
+    RAMDISK = "ramdisk"  # 内存盘：第一版不统计
+    UNKNOWN = "unknown"  # 未知/未挂载：不统计
 
 
 #: 第一版纳入统计的磁盘类型。
@@ -42,10 +57,10 @@ INCLUDED_DRIVE_KINDS: frozenset[DriveKind] = frozenset({DriveKind.FIXED})
 class CleanOutcome(Enum):
     """清空操作的最终结果类型。"""
 
-    SUCCESS = "success"          # 清空后复核为 0
-    PARTIAL = "partial"          # 清空执行了，但复核后仍有剩余项目
-    FAILED = "failed"            # API 返回错误
-    INCOMPLETE = "incomplete"    # 前置复核或后置复核失败/不完整，未确认结果
+    SUCCESS = "success"  # 清空后复核为 0
+    PARTIAL = "partial"  # 清空执行了，但复核后仍有剩余项目
+    FAILED = "failed"  # API 返回错误
+    INCOMPLETE = "incomplete"  # 前置复核或后置复核失败/不完整，未确认结果
 
 
 class MonitorState(Enum):
@@ -66,23 +81,19 @@ class MonitorState(Enum):
 class DiskScanResult:
     """单个磁盘的回收站查询结果。"""
 
-    root: str                      # 磁盘根，如 "C:\\"
+    root: str  # 磁盘根，如 "C:\\"
     kind: DriveKind = DriveKind.UNKNOWN
-    ok: bool = False               # 查询是否成功
-    num_items: int = 0             # SHQUERYRBINFO.i64NumItems
-    size_bytes: int = 0            # SHQUERYRBINFO.i64Size
-    hresult: int = 0               # API 返回的 HRESULT
-    error: str | None = None       # 失败原因（人类可读）
+    ok: bool = False  # 查询是否成功
+    num_items: int = 0  # SHQUERYRBINFO.i64NumItems
+    size_bytes: int = 0  # SHQUERYRBINFO.i64Size
+    hresult: int = 0  # API 返回的 HRESULT
+    error: str | None = None  # 失败原因（人类可读）
 
     def __post_init__(self) -> None:
         if self.ok and self.num_items < 0:
-            raise ValueError(
-                f"磁盘 {self.root} 的 num_items 不能为负数：{self.num_items}"
-            )
+            raise ValueError(f"磁盘 {self.root} 的 num_items 不能为负数：{self.num_items}")
         if self.ok and self.size_bytes < 0:
-            raise ValueError(
-                f"磁盘 {self.root} 的 size_bytes 不能为负数：{self.size_bytes}"
-            )
+            raise ValueError(f"磁盘 {self.root} 的 size_bytes 不能为负数：{self.size_bytes}")
 
 
 @dataclass(frozen=True)
@@ -108,14 +119,22 @@ class ScanResult:
         """
         return not self.failed_roots and self.error is None
 
-    def should_trigger(self, threshold_items: int) -> bool:
+    def should_trigger(self, threshold_items: int, threshold_size_bytes: int = 0) -> bool:
         """判断是否达到清理阈值。
+
+        两条阈值任一满足即触发（都需统计完整）：
+
+        - ``total_items >= threshold_items``（项目数阈值）；
+        - ``threshold_size_bytes > 0`` 且 ``total_size_bytes >= threshold_size_bytes``
+          （占用大小阈值；``0`` 表示不启用）。
 
         **统计不完整时永远返回 False**，避免把未知磁盘当成 0 导致误判。
         """
         if not self.is_complete:
             return False
-        return self.total_items >= threshold_items
+        if self.total_items >= threshold_items:
+            return True
+        return threshold_size_bytes > 0 and self.total_size_bytes >= threshold_size_bytes
 
 
 @dataclass(frozen=True)
@@ -145,11 +164,15 @@ class RecycleBinService(Protocol):
         """统计所有应纳入磁盘的回收站项目数，不产生任何副作用。"""
         ...
 
-    def empty(self) -> CleanResult:
+    def empty(self, *, verified_scan: ScanResult | None = None) -> CleanResult:
         """清空整个回收站。
 
         实现必须自行完成：清空前复核 -> 调用清空 API -> 清空后复核，
         且不允许被 :meth:`scan` 隐式调用。
+
+        :param verified_scan: 调用方（监控器）刚刚做过的**清空前复核**结果。
+            提供且完整时复用它，避免再扫一遍；不完整或未提供时由实现自行扫描，
+            安全性完全不变。
         """
         ...
 

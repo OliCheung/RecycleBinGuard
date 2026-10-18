@@ -3,3 +3,5 @@
 # 开发/测试/打包依赖
 pytest>=8.3
 pyinstaller>=6.6
+ruff>=0.6
+mypy>=1.11

@@ -8,13 +8,32 @@ version = "0.1.0"
 description = "Windows 10 回收站后台监控与自动清理工具"
 requires-python = ">=3.11"
 readme = "README.md"
+license = { text = "MIT" }
+keywords = ["windows", "recycle-bin", "disk-cleanup", "tray", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
+]
 dependencies = [
     "pystray==0.19.5",
     "Pillow==10.4.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==8.3.3"]
+dev = [
+    "pytest>=8.3",
+    "pyinstaller>=6.6",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
 
 [project.gui-scripts]
 recyclebingguard = "recyclebingguard.__main__:main"
@@ -22,7 +41,37 @@ recyclebingguard = "recyclebingguard.__main__:main"
 [tool.setuptools]
 packages = ["recyclebingguard"]
 
+[tool.setuptools.package-data]
+# 图标源文件必须随包分发：托盘 / 窗口图标运行时从 assets/icon.png 现算
+recyclebingguard = ["assets/*.png"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["recyclebingguard", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    # 中文注释较长，行宽由 line-length 兜底；E501 对注释/字符串噪音大。
+    "E501",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["recyclebingguard"]
+
+[tool.mypy]
+python_version = "3.11"
+platform = "win32"
+files = ["recyclebingguard"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+no_implicit_optional = true
+check_untyped_defs = true
+

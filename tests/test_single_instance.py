@@ -57,13 +57,13 @@ def test_lock_recovers_after_process_dies(tmp_path: Path) -> None:
     lock_path = tmp_path / "app.lock"
     code = (
         "import sys;"
-        "sys.path.insert(0, r'{}');"
+        f"sys.path.insert(0, r'{str(Path(__file__).resolve().parents[1])}');"
         "from recyclebingguard.single_instance import SingleInstance;"
-        "i = SingleInstance(r'{}');"
+        f"i = SingleInstance(r'{str(lock_path)}');"
         "assert i.acquire();"
         "print('LOCKED', flush=True);"
         "import time; time.sleep(30)"
-    ).format(str(Path(__file__).resolve().parents[1]), str(lock_path))
+    )
 
     child = subprocess.Popen(
         [sys.executable, "-c", code],
@@ -74,12 +74,14 @@ def test_lock_recovers_after_process_dies(tmp_path: Path) -> None:
     try:
         assert child.stdout is not None
         line = child.stdout.readline().strip()
-        assert line == "LOCKED", f"子进程未能加锁：{line} {child.stderr.read() if child.stderr else ''}"
+        assert line == "LOCKED", (
+            f"子进程未能加锁：{line} {child.stderr.read() if child.stderr else ''}"
+        )
 
         # 子进程持锁期间，本进程无法获取
         assert SingleInstance(lock_path).acquire() is False
     finally:
-        child.kill()          # 模拟异常终止（非正常释放）
+        child.kill()  # 模拟异常终止（非正常释放）
         child.wait(timeout=10)
 
     # 子进程被强杀后，锁应自动释放
@@ -130,7 +132,7 @@ def test_request_wake_creates_file(isolated_home: Path) -> None:
     assert request_wake() is True
     assert target.exists()
 
-    assert take_wake_request() is True      # 被消费一次
+    assert take_wake_request() is True  # 被消费一次
     assert not target.exists()
 
 

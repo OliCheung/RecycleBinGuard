@@ -12,17 +12,15 @@ from pathlib import Path
 import pytest
 
 from recyclebingguard.app import (
-    LABEL_AUTO_OFF,
     LABEL_AUTO_ON,
     LABEL_CLEAN_FAILED,
-    LABEL_DRY_RUN,
     LABEL_INCOMPLETE,
     LABEL_MONITORING,
     LABEL_PAUSED,
     AppController,
     RiskConfirmationRequired,
 )
-from recyclebingguard.config import Config, load_config
+from recyclebingguard.config import Config, ConfigError, load_config
 from recyclebingguard.interfaces import (
     CleanOutcome,
     CleanResult,
@@ -41,7 +39,7 @@ class FakeService:
     def scan(self) -> ScanResult:
         return self.result
 
-    def empty(self) -> CleanResult:
+    def empty(self, *, verified_scan: ScanResult | None = None) -> CleanResult:
         self.empty_calls += 1
         return self.empty_result
 
@@ -69,14 +67,12 @@ def controller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 def test_default_labels(controller: AppController) -> None:
     labels = controller.state_labels()
-    assert labels == [LABEL_MONITORING, LABEL_DRY_RUN, LABEL_AUTO_OFF]
+    assert labels == [LABEL_MONITORING, LABEL_AUTO_ON]
     assert LABEL_MONITORING in controller.state_summary()
 
 
 def test_labels_when_auto_clean_enabled(controller: AppController) -> None:
-    controller.config.dry_run = False
     controller.config.auto_clean_enabled = True
-    controller.monitor.config.dry_run = False
     controller.monitor.config.auto_clean_enabled = True
 
     labels = controller.state_labels()
@@ -106,6 +102,7 @@ def test_labels_after_pause(controller: AppController) -> None:
 
 
 def test_enable_requires_risk_confirmation(controller: AppController) -> None:
+    controller.config.auto_clean_enabled = False  # 从“关闭”状态验证启用需风险确认
     assert controller.needs_risk_confirmation() is True
 
     with pytest.raises(RiskConfirmationRequired):
@@ -113,7 +110,7 @@ def test_enable_requires_risk_confirmation(controller: AppController) -> None:
 
     assert controller.config.auto_clean_enabled is False
     assert controller.monitor.config.auto_clean_enabled is False
-    assert not controller.config_path.exists()   # 未确认就不持久化
+    assert not controller.config_path.exists()  # 未确认就不持久化
 
 
 def test_enable_with_acknowledgement_persists(controller: AppController) -> None:
@@ -137,17 +134,19 @@ def test_second_enable_does_not_require_confirmation(controller: AppController) 
     controller.set_auto_clean_enabled(False)
 
     assert controller.needs_risk_confirmation() is False
-    controller.set_auto_clean_enabled(True)      # 不再抛异常
+    controller.set_auto_clean_enabled(True)  # 不再抛异常
     assert controller.config.auto_clean_enabled is True
 
 
 def test_disable_does_not_require_confirmation(controller: AppController) -> None:
     controller.set_auto_clean_enabled(False)
     assert controller.config.auto_clean_enabled is False
-    assert controller.config_path.exists()       # 关闭动作应当持久化
+    assert controller.config_path.exists()  # 关闭动作应当持久化
 
 
 def test_toggle_auto_clean_roundtrip(controller: AppController) -> None:
+    controller.config.auto_clean_enabled = False
+    controller.config.auto_clean_confirmed = False
     assert controller.toggle_auto_clean(risk_acknowledged=True) is True
     assert controller.toggle_auto_clean() is False
 
@@ -155,13 +154,6 @@ def test_toggle_auto_clean_roundtrip(controller: AppController) -> None:
 # --------------------------------------------------------------------------
 # 其它操作
 # --------------------------------------------------------------------------
-
-
-def test_toggle_dry_run_persists(controller: AppController) -> None:
-    assert controller.toggle_dry_run() is False
-    assert controller.config.dry_run is False
-    saved = json.loads(controller.config_path.read_text(encoding="utf-8"))
-    assert saved["dry_run"] is False
 
 
 def test_toggle_hotkey_persists(controller: AppController) -> None:
@@ -181,6 +173,22 @@ def test_install_shortcuts_delegates(
     )
     controller.install_shortcuts()
     assert calls == [1]
+
+
+def test_install_shortcuts_passes_icon(
+    controller: AppController, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """快捷方式必须带上项目图标，否则只显示解释器的通用图标。"""
+    icon = tmp_path / "app.ico"
+    icon.write_bytes(b"ico")
+    seen: list[str | None] = []
+    monkeypatch.setattr("recyclebingguard.assets.shortcut_icon_path", lambda: icon)
+    monkeypatch.setattr(
+        "recyclebingguard.shortcuts.install_shortcuts",
+        lambda *a, **k: seen.append(k.get("icon_path")) or [],
+    )
+    controller.install_shortcuts()
+    assert seen == [str(icon)]
 
 
 def test_install_shortcuts_failure_is_not_fatal(
@@ -236,7 +244,7 @@ def test_request_check_is_not_swallowed_on_error(controller: AppController) -> N
 
 def test_request_check_after_shutdown_is_noop(controller: AppController) -> None:
     controller.shutdown()
-    controller.request_check()   # 不应抛异常
+    controller.request_check()  # 不应抛异常
 
 
 def test_shutdown_is_idempotent(controller: AppController) -> None:
@@ -273,7 +281,7 @@ def test_persist_failure_is_not_fatal(controller: AppController, monkeypatch) ->
     monkeypatch.setattr("recyclebingguard.app.save_config", boom)
 
     controller.set_auto_clean_enabled(True, risk_acknowledged=True)
-    assert controller.config.auto_clean_enabled is True   # 内存状态仍生效
+    assert controller.config.auto_clean_enabled is True  # 内存状态仍生效
 
 
 def test_monitor_must_share_config_object(tmp_path: Path) -> None:
@@ -281,4 +289,62 @@ def test_monitor_must_share_config_object(tmp_path: Path) -> None:
     monitor = RecycleBinMonitor(FakeService(), Config())  # 不同的 Config 对象
 
     with pytest.raises(ValueError):
-        AppController(config, service=FakeService(), monitor=monitor, config_path=tmp_path / "c.json")
+        AppController(
+            config, service=FakeService(), monitor=monitor, config_path=tmp_path / "c.json"
+        )
+
+
+# --------------------------------------------------------------------------
+# 设置（阈值 / 间隔 / 排除盘符）
+# --------------------------------------------------------------------------
+
+
+def test_apply_settings_updates_and_persists(controller: AppController) -> None:
+    controller.apply_settings(
+        threshold_items=20000,
+        threshold_size_bytes=2 * 1024**3,
+        poll_interval_seconds=600,
+        excluded_roots=["d:"],
+    )
+
+    assert controller.config.threshold_items == 20000
+    assert controller.config.threshold_size_bytes == 2 * 1024**3
+    assert controller.config.poll_interval_seconds == 600
+    assert controller.config.excluded_roots == ["D:\\"]
+    # monitor 与控制器共享同一 Config 对象，必须同步看到新值
+    assert controller.monitor.config.threshold_items == 20000
+
+    saved = load_config(controller.config_path)
+    assert saved.threshold_items == 20000
+    assert saved.excluded_roots == ["D:\\"]
+
+
+def test_apply_settings_ignores_none_values(controller: AppController) -> None:
+    before = controller.config.poll_interval_seconds
+    controller.apply_settings(threshold_items=123, poll_interval_seconds=None)
+
+    assert controller.config.threshold_items == 123
+    assert controller.config.poll_interval_seconds == before
+
+
+def test_apply_settings_rejects_invalid_and_keeps_old(controller: AppController) -> None:
+    with pytest.raises(ConfigError):
+        controller.apply_settings(threshold_items=0)
+
+    assert controller.config.threshold_items == 10000
+    with pytest.raises(ConfigError):
+        controller.apply_settings(excluded_roots=["not a drive"])
+    assert controller.config.excluded_roots == []
+
+
+def test_apply_settings_syncs_service_filters(controller: AppController) -> None:
+    calls: list[list[str]] = []
+
+    class FilteredService(FakeService):
+        def set_excluded_roots(self, roots) -> None:
+            calls.append(list(roots))
+
+    controller.service = FilteredService()
+    controller.apply_settings(excluded_roots=["E:"])
+
+    assert calls[-1] == ["E:\\"]

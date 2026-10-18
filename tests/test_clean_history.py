@@ -17,10 +17,11 @@ from recyclebingguard.app import AppController
 from recyclebingguard.clean_history import (
     MAX_RECORDS,
     CleanHistory,
+    CleanHistoryError,
     CleanRecord,
 )
 from recyclebingguard.config import Config
-from recyclebingguard.confirmation import ConfirmationDecision, ConfirmationRequester
+from recyclebingguard.confirmation import ConfirmationDecision
 from recyclebingguard.interfaces import (
     CleanOutcome,
     CleanResult,
@@ -59,7 +60,7 @@ class FakeBinService:
     def scan(self) -> ScanResult:
         return self.default_scan
 
-    def empty(self) -> CleanResult:
+    def empty(self, *, verified_scan: ScanResult | None = None) -> CleanResult:
         self.empty_calls += 1
         return self.default_empty
 
@@ -95,7 +96,6 @@ def make_monitor(tmp_path: Path, **cfg) -> tuple[RecycleBinMonitor, FakeBinServi
         threshold_items=THRESHOLD,
         poll_interval_seconds=180,
         auto_clean_enabled=True,
-        dry_run=False,
         confirm_before_clean=False,
     )
     base.update(cfg)
@@ -138,7 +138,7 @@ def test_record_describe_contains_time_and_counts() -> None:
 
 
 def test_record_bad_timestamp_is_rejected() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(CleanHistoryError):
         CleanRecord.from_dict({"finished_at": "not-a-time"})
 
 
@@ -210,7 +210,7 @@ def test_corrupt_file_is_treated_as_empty(tmp_path: Path) -> None:
 
     assert history.load() == []
     assert history.last() is None
-    assert history.append(make_record()) is True   # 仍可自愈写入
+    assert history.append(make_record()) is True  # 仍可自愈写入
     assert len(history.load()) == 1
 
 
@@ -298,7 +298,7 @@ def test_exception_during_clean_is_recorded(tmp_path: Path) -> None:
     monitor, service = make_monitor(tmp_path)
     service.default_scan = ok_scan(10000)
 
-    def boom() -> CleanResult:
+    def boom(*args: object, **kwargs: object) -> CleanResult:
         raise RuntimeError("explode")
 
     service.empty = boom  # type: ignore[method-assign]
@@ -311,23 +311,16 @@ def test_exception_during_clean_is_recorded(tmp_path: Path) -> None:
     assert "explode" in (record.error or "")
 
 
-def test_dry_run_is_not_recorded(tmp_path: Path) -> None:
-    monitor, service = make_monitor(tmp_path, dry_run=True)
-    service.default_scan = ok_scan(50000)
-
-    monitor.tick()
-
-    assert service.empty_calls == 0
-    assert monitor.last_clean_record() is None
-
-
 def test_cancelled_confirmation_is_not_recorded(tmp_path: Path) -> None:
     service = FakeBinService()
     service.default_scan = ok_scan(10000)
     requester = AutoRequester(ConfirmationDecision.CANCELLED)
     monitor = RecycleBinMonitor(
         service,
-        Config(threshold_items=THRESHOLD, auto_clean_enabled=True, dry_run=False),
+        Config(
+            threshold_items=THRESHOLD,
+            auto_clean_enabled=True,
+        ),
         history=CleanHistory(tmp_path / "clean_history.json"),
         confirmation_requester=requester,
     )
@@ -345,7 +338,10 @@ def test_confirmed_clean_records_trigger(tmp_path: Path) -> None:
     requester = AutoRequester(ConfirmationDecision.CONFIRMED)
     monitor = RecycleBinMonitor(
         service,
-        Config(threshold_items=THRESHOLD, auto_clean_enabled=True, dry_run=False),
+        Config(
+            threshold_items=THRESHOLD,
+            auto_clean_enabled=True,
+        ),
         history=CleanHistory(tmp_path / "clean_history.json"),
         confirmation_requester=requester,
     )
@@ -364,7 +360,10 @@ def test_timeout_clean_records_timeout_trigger(tmp_path: Path) -> None:
     requester = AutoRequester(ConfirmationDecision.TIMEOUT)
     monitor = RecycleBinMonitor(
         service,
-        Config(threshold_items=THRESHOLD, auto_clean_enabled=True, dry_run=False),
+        Config(
+            threshold_items=THRESHOLD,
+            auto_clean_enabled=True,
+        ),
         history=CleanHistory(tmp_path / "clean_history.json"),
         confirmation_requester=requester,
     )
@@ -388,7 +387,10 @@ def test_recheck_failure_is_not_recorded(tmp_path: Path) -> None:
     requester = AutoRequester(ConfirmationDecision.CONFIRMED)
     monitor = RecycleBinMonitor(
         service,
-        Config(threshold_items=THRESHOLD, auto_clean_enabled=True, dry_run=False),
+        Config(
+            threshold_items=THRESHOLD,
+            auto_clean_enabled=True,
+        ),
         history=CleanHistory(tmp_path / "clean_history.json"),
         confirmation_requester=requester,
     )
@@ -456,7 +458,6 @@ def _controller(tmp_path: Path) -> tuple[AppController, FakeBinService, CleanHis
     config = Config(
         threshold_items=THRESHOLD,
         auto_clean_enabled=True,
-        dry_run=False,
         confirm_before_clean=False,
     )
     service = FakeBinService()

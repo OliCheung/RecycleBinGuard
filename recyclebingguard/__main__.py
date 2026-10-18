@@ -8,21 +8,27 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import shutil
+import subprocess
 import sys
+import time
 import traceback
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any
 
 from . import APP_NAME, __version__, paths
-from .config import ConfigError, load_config, save_config
-from .logging_setup import setup_logging
+from .config import Config, ConfigError, load_config, save_config
+from .logging_setup import setup_logging, shutdown_logging
 from .single_instance import SingleInstance, request_wake
 
 EXIT_OK = 0
+#: 保留：配置损坏时现在会自动备份并回退默认配置（见 ``_load_config_with_recovery``），
+#: 正常路径不再返回该退出码，但保留常量以免破坏既有脚本对退出码的引用。
 EXIT_CONFIG_ERROR = 2
 EXIT_ALREADY_RUNNING = 3
 EXIT_UNSUPPORTED = 4
@@ -40,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--init-config",
         action="store_true",
-        help="在当前用户数据目录写入一份默认（安全）配置后退出",
+        help="在程序目录写入一份默认（安全）配置后退出",
     )
     parser.add_argument(
         "--check-once",
@@ -90,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
             "（打包成无控制台的 GUI 程序时用于排查，例如 --check-once --report out.txt）"
         ),
     )
+    parser.add_argument(
+        "--replace-target",
+        metavar="PATH",
+        help="（内部）升级换包时使用：新实例把自身覆盖到 PATH 指向的旧 EXE",
+    )
     return parser
 
 
@@ -106,6 +117,7 @@ def _open_report(path: str | None) -> Iterator[Emit | None]:
 
     handle = target.open("a", encoding="utf-8")
     try:
+
         def write(text: str = "") -> None:
             handle.write(f"{text}\n")
             handle.flush()
@@ -134,9 +146,18 @@ def _warn_already_running() -> None:
         import tkinter as tk
         from tkinter import messagebox
 
+        from . import assets
+
         root = tk.Tk()
         root.withdraw()
-        messagebox.showinfo(APP_NAME, message)
+        icon = assets.load_icon(assets.MAX_ICON_SIZE)
+        if icon is not None:
+            from PIL import ImageTk
+
+            # 局部变量持有引用，否则 PhotoImage 被回收后弹窗会显示空白图标
+            photo: Any = ImageTk.PhotoImage(icon)
+            root.iconphoto(True, photo)
+        messagebox.showinfo(APP_NAME, message, parent=root)
         root.destroy()
     except Exception:
         print(f"[{APP_NAME}] {message}", file=sys.stderr)
@@ -161,7 +182,7 @@ def _run_check_once(emit: Emit) -> int:
     return EXIT_OK
 
 
-def _handle_autostart(action: str, emit: Emit) -> int:
+def _handle_autostart(action: str, emit: Emit, config: Config) -> int:
     from . import autostart
 
     try:
@@ -180,7 +201,6 @@ def _handle_autostart(action: str, emit: Emit) -> int:
     # 必须同步回配置文件：否则启动时 sync_start_on_login() 的自愈逻辑
     # 会认为“配置没要求自启但注册表里有”，反过来把启动项删掉。
     try:
-        config = load_config()
         config.start_on_login = state
         save_config(config)
     except ConfigError as exc:
@@ -234,11 +254,22 @@ def _handle_uninstall(purge: bool, emit: Emit) -> int:
         emit(f"[{APP_NAME}] 已删除快捷方式：{path}")
 
     home = paths.app_home()
-    if purge:
-        shutil.rmtree(home, ignore_errors=True)
-        emit(f"[{APP_NAME}] 已删除配置与日志：{home}")
-    else:
+    if not purge:
         emit(f"[{APP_NAME}] 已保留配置与日志：{home}（如需彻底删除请加 --purge）")
+        return EXIT_OK
+
+    # 数据目录现在就是程序目录：绝不能整目录删除，只清理本程序自己的产物。
+    # 先释放日志句柄，否则 Windows 上删不掉 logs/。
+    shutdown_logging()
+    for target in paths.runtime_paths():
+        try:
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[{APP_NAME}] 删除失败：{target}（{exc}）", file=sys.stderr)
+    emit(f"[{APP_NAME}] 已删除配置、日志与缓存：{home}")
     return EXIT_OK
 
 
@@ -256,6 +287,34 @@ def _ensure_std_streams() -> None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 
+def _apply_replace_target(target: Path) -> None:
+    """新实例：把自身（``sys.executable``）覆盖到 ``target``（旧 EXE）。
+
+    旧版本先备份为 ``target.bak``；若旧实例仍占用文件（``PermissionError``），
+    最多重试约 10 秒，等待其退出后再覆盖。覆盖失败仅记录错误，本实例仍正常运行。
+    """
+    log = logging.getLogger(APP_NAME)
+    backup = target.with_name(target.name + ".bak")
+    for attempt in range(20):
+        try:
+            if target.exists():
+                try:
+                    if backup.exists():
+                        backup.unlink()
+                    shutil.copyfile(target, backup)
+                except OSError as exc:
+                    log.warning("备份旧版本失败：%s（%s）", backup, exc)
+                target.unlink()
+            shutil.copyfile(sys.executable, target)
+            log.info("已将新版本写入 %s（旧版本备份为 %s）", target, backup)
+            return
+        except PermissionError:
+            if attempt == 0:
+                log.info("等待旧实例退出以覆盖 %s", target)
+            time.sleep(0.5)
+    log.error("覆盖 %s 失败：旧实例可能仍占用文件", target)
+
+
 def main(argv: list[str] | None = None) -> int:
     _ensure_std_streams()
     args = build_parser().parse_args(argv)
@@ -265,9 +324,50 @@ def main(argv: list[str] | None = None) -> int:
         return _dispatch(args, emit)
 
 
+def _quarantine_config(path: Path) -> Path | None:
+    """把损坏的配置文件改名备份（``config.json.bad-<时间戳>``）。"""
+    try:
+        if not path.exists():
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = path.with_name(f"{path.name}.bad-{stamp}")
+        path.replace(backup)
+        return backup
+    except OSError:
+        return None
+
+
+def _load_config_with_recovery() -> tuple[Config, str | None]:
+    """读取配置；损坏时备份原文件、回退默认配置并写入。
+
+    返回 ``(配置, 恢复说明)``；``恢复说明`` 为 ``None`` 表示配置正常。
+    这样单一坏文件不会把程序挡在启动之外，同时改动前可追溯（原文件被保留）。
+    """
+    try:
+        return load_config(), None
+    except ConfigError as exc:
+        backup = _quarantine_config(paths.config_path())
+        message = f"配置文件不可用，已回退默认配置：{exc}"
+        if backup is not None:
+            message += f"（原文件已备份为 {backup.name}）"
+        config = Config()
+        try:
+            save_config(config)
+        except OSError:
+            pass
+        return config, message
+
+
 def _dispatch(args: argparse.Namespace, emit: Emit) -> int:
+    # 配置优先“自愈加载”：即使 config.json 损坏也能启动，并把问题写进日志。
+    config, recovery = _load_config_with_recovery()
+    logger = setup_logging(config, to_console=args.console_log)
+    if recovery:
+        logger.warning("%s", recovery)
+        emit(f"[{APP_NAME}] {recovery}")
+
     if args.autostart:
-        return _handle_autostart(args.autostart, emit)
+        return _handle_autostart(args.autostart, emit, config)
 
     if args.install_shortcuts:
         return _handle_shortcuts(install=True, emit=emit)
@@ -278,17 +378,9 @@ def _dispatch(args: argparse.Namespace, emit: Emit) -> int:
     if args.uninstall:
         return _handle_uninstall(args.purge, emit)
 
-    try:
-        config = load_config()
-    except ConfigError as exc:
-        print(f"[{APP_NAME}] 配置错误：{exc}", file=sys.stderr)
-        return EXIT_CONFIG_ERROR
-
     if args.init_config:
         emit(f"[{APP_NAME}] 已写入默认配置：{save_config(config)}")
         return EXIT_OK
-
-    logger = setup_logging(config, to_console=args.console_log)
 
     if args.check_once:
         return _run_check_once(emit)
@@ -303,21 +395,41 @@ def _dispatch(args: argparse.Namespace, emit: Emit) -> int:
             _warn_already_running()
         return EXIT_ALREADY_RUNNING
 
+    # 升级换包：若本实例由更新机制启动（携带 --replace-target），
+    # 先把自身覆盖到旧 EXE，再作为活动实例正常运行。
+    if args.replace_target:
+        _apply_replace_target(Path(args.replace_target))
+
     try:
         from .app import AppController
         from .tray import run_tray
 
         controller = AppController(config)
         logger.info(
-            "%s %s 启动：阈值=%d 间隔=%ds 自动清理=%s 试运行=%s",
+            "%s %s 启动：阈值=%d 间隔=%ds 自动清理=%s",
             APP_NAME,
             __version__,
             config.threshold_items,
             config.poll_interval_seconds,
             config.auto_clean_enabled,
-            config.dry_run,
         )
-        run_tray(controller, start_minimized=args.start_minimized)
+
+        def on_apply_update(new_exe: Path) -> None:
+            """自动升级：释放单实例锁、启动新 EXE（由其覆盖旧文件）、本实例退出。"""
+            instance.release()
+            try:
+                subprocess.Popen([str(new_exe), "--replace-target", str(Path(sys.executable))])
+            except OSError:
+                logger.exception("启动新版本失败")
+                return
+            logger.info("已启动新版本，本实例即将退出以释放文件锁")
+            os._exit(0)
+
+        run_tray(
+            controller,
+            start_minimized=args.start_minimized,
+            on_apply_update=on_apply_update,
+        )
     except Exception:
         logger.exception("程序异常退出")
         raise
@@ -329,7 +441,7 @@ def _dispatch(args: argparse.Namespace, emit: Emit) -> int:
 
 def crash_log_path() -> Path:
     """崩溃日志位置（与配置、日志同目录）。"""
-    return paths.app_home() / "crash.log"
+    return paths.crash_log_path()
 
 
 def _write_crash_log(exc: BaseException) -> Path | None:

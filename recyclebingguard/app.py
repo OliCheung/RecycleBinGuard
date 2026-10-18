@@ -16,17 +16,18 @@
 from __future__ import annotations
 
 import threading
+from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable
 
-from . import autostart, paths, shortcuts
+from . import assets, autostart, paths, shortcuts
+from .appearance import next_mode
 from .clean_history import CleanRecord
-from .config import Config, save_config
+from .config import DEFAULTS, Config, save_config
 from .confirmation import (
     CleanConfirmationRequest,
     ConfirmationDecision,
-    ConfirmationRequester,
 )
 from .interfaces import MonitorState
 from .logging_setup import get_logger
@@ -45,7 +46,6 @@ RISK_NOTICE = (
 
 #: 状态标签（PRD 要求托盘能够明确区分这些状态）。
 LABEL_MONITORING = "正在监控"
-LABEL_DRY_RUN = "试运行（只记录，不清空）"
 LABEL_AUTO_ON = "自动清理已启用"
 LABEL_AUTO_OFF = "自动清理已关闭"
 LABEL_INCOMPLETE = "统计不完整"
@@ -75,15 +75,16 @@ class AppController:
         self.log_path = Path(log_path) if log_path else paths.log_file_path()
 
         self.service = service if service is not None else RecycleBinService()
-        self.monitor = (
-            monitor if monitor is not None else RecycleBinMonitor(self.service, config)
-        )
+        self.monitor = monitor if monitor is not None else RecycleBinMonitor(self.service, config)
         if self.monitor.config is not config:
             raise ValueError("monitor 必须与控制器共享同一个 Config 对象")
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="RBG-Action")
         self._lock = threading.RLock()
         self._shutdown = False
+
+        #: 把配置中的“排除盘符”同步给服务层（服务负责扫描与逐盘清空的范围）。
+        self._sync_service_filters()
 
         #: 供 UI 注册的变更回调（可能在后台线程被调用）。
         self.on_status: Callable[[MonitorStatus], None] | None = None
@@ -192,8 +193,6 @@ class AppController:
         if status.pending_confirmation or status.state is MonitorState.AWAITING_CONFIRMATION:
             labels.append(LABEL_AWAITING_CONFIRMATION)
 
-        if status.dry_run:
-            labels.append(LABEL_DRY_RUN)
         labels.append(LABEL_AUTO_ON if status.auto_clean_enabled else LABEL_AUTO_OFF)
 
         scan = status.last_scan
@@ -209,6 +208,10 @@ class AppController:
 
     def is_paused(self) -> bool:
         return self.monitor.state is MonitorState.PAUSED
+
+    def seconds_until_next_check(self) -> int:
+        """下一次检查的近似剩余秒数（供 UI 展示，已计入退避与清理耗时）。"""
+        return self.monitor.seconds_until_next_check()
 
     # -- 清理历史（持久化，重启后仍在）--
 
@@ -238,16 +241,20 @@ class AppController:
         return f"{record.describe()}（上次成功：{success.format_time()}）"
 
     def recent_logs(self, limit: int = 200) -> list[str]:
-        """读取最近若干行日志（不记录文件内容，只回显日志行）。"""
+        """读取最近若干行日志（不记录文件内容，只回显日志行）。
+
+        使用 :class:`collections.deque` 流式读取，只保留尾部，避免把整个
+        轮转日志（默认最大 1 MiB）读入内存。
+        """
         if not self.log_path.exists():
             return []
         try:
             with self.log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                lines = handle.readlines()
+                lines = deque(handle, maxlen=max(limit, 0))
         except OSError:
             logger.exception("读取日志失败")
             return []
-        return [line.rstrip("\r\n") for line in lines[-limit:]]
+        return [line.rstrip("\r\n") for line in lines]
 
     # ------------------------------------------------------------------
     # 操作
@@ -295,9 +302,7 @@ class AppController:
         """启用自动清理前是否还需要风险确认（仅在首次需要）。"""
         return not self.config.auto_clean_confirmed
 
-    def set_auto_clean_enabled(
-        self, enabled: bool, *, risk_acknowledged: bool = False
-    ) -> None:
+    def set_auto_clean_enabled(self, enabled: bool, *, risk_acknowledged: bool = False) -> None:
         """启用/关闭自动清理并持久化配置。
 
         :param enabled: 目标状态。
@@ -305,9 +310,7 @@ class AppController:
         :raises RiskConfirmationRequired: 首次启用但未确认风险。
         """
         if enabled and self.needs_risk_confirmation() and not risk_acknowledged:
-            raise RiskConfirmationRequired(
-                "首次启用自动清理前必须向用户展示不可逆删除风险说明"
-            )
+            raise RiskConfirmationRequired("首次启用自动清理前必须向用户展示不可逆删除风险说明")
 
         if enabled and not self.config.auto_clean_confirmed:
             self.config.auto_clean_confirmed = True
@@ -322,15 +325,45 @@ class AppController:
         self.set_auto_clean_enabled(target, risk_acknowledged=risk_acknowledged)
         return self.config.auto_clean_enabled
 
-    def set_dry_run(self, dry_run: bool) -> None:
-        """切换试运行模式并持久化。"""
-        self.monitor.set_dry_run(dry_run)
-        self._persist()
+    # -- 设置（阈值 / 间隔 / 排除盘符）--
 
-    def toggle_dry_run(self) -> bool:
-        target = not self.config.dry_run
-        self.set_dry_run(target)
-        return target
+    def apply_settings(self, **changes: object) -> Config:
+        """校验并应用设置变更，持久化后返回配置对象。
+
+        ``None`` 的项表示“不修改”。任一取值非法时抛出
+        :class:`~recyclebingguard.config.ConfigError`，且**不改动**当前配置。
+
+        :param changes: 例如 ``threshold_items=20000``、
+            ``poll_interval_seconds=600``、``threshold_size_bytes=0``、
+            ``excluded_roots=["D:\\"]``。
+        """
+        data = self.config.to_dict()
+        for key, value in changes.items():
+            if value is not None:
+                data[key] = value
+
+        candidate = Config.from_dict(data)  # 校验失败会抛 ConfigError
+
+        # 就地更新共享的配置对象（monitor 与此处必须是同一个对象）。
+        for name in DEFAULTS:
+            setattr(self.config, name, getattr(candidate, name))
+
+        self._sync_service_filters()
+        self._persist()
+        logger.warning(
+            "设置已更新：阈值=%d 大小阈值=%d 间隔=%ds 排除盘符=%s",
+            self.config.threshold_items,
+            self.config.threshold_size_bytes,
+            self.config.poll_interval_seconds,
+            self.config.excluded_roots,
+        )
+        return self.config
+
+    def _sync_service_filters(self) -> None:
+        """把 ``excluded_roots`` 同步给服务层（测试替身没有该方法时跳过）。"""
+        setter = getattr(self.service, "set_excluded_roots", None)
+        if callable(setter):
+            setter(self.config.excluded_roots)
 
     # -- 打开入口（热键 / 快捷方式）--
 
@@ -340,10 +373,29 @@ class AppController:
         self._persist()
         return self.config.hotkey_enabled
 
+    # -- 界面皮肤 --
+
+    def set_theme(self, mode: str) -> str:
+        """设置界面皮肤（``auto`` / ``light`` / ``dark``）并持久化。
+
+        :param mode: 目标模式；非法值抛
+            :class:`~recyclebingguard.config.ConfigError`，且不改动当前配置。
+        :returns: 生效后的模式。
+        """
+        self.apply_settings(theme=mode)
+        logger.info("界面皮肤已切换为 %s", self.config.theme)
+        return self.config.theme
+
+    def cycle_theme(self) -> str:
+        """在 ``auto -> light -> dark`` 之间循环切换皮肤，返回切换后的模式。"""
+        return self.set_theme(next_mode(self.config.theme))
+
     def install_shortcuts(self) -> list[Path]:
         """创建开始菜单 / 桌面快捷方式，返回成功创建的路径。"""
+        # 带上图标，否则快捷方式只会显示 pythonw.exe / 通用程序图标
+        icon = assets.shortcut_icon_path()
         try:
-            created = shortcuts.install_shortcuts()
+            created = shortcuts.install_shortcuts(icon_path=str(icon) if icon else None)
         except shortcuts.ShortcutUnsupportedError as exc:
             logger.warning("%s", exc)
             return []
