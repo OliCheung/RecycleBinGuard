@@ -6,6 +6,7 @@
 - 占用大小阈值（MB，``0`` = 不启用）；
 - 检查间隔（秒）；
 - 排除的盘符（不统计、也不清空，如 ``D:``）；
+- 开机启动（登录 Windows 后在托盘静默运行）；
 - 界面皮肤（跟随系统时间 / 浅色 / 深色）。
 
 校验与持久化都交给 :meth:`AppController.apply_settings`：这里只负责把界面输入
@@ -24,6 +25,7 @@ from collections.abc import Callable
 from tkinter import messagebox, ttk
 from typing import Any
 
+from . import autostart
 from .app import AppController
 from .appearance import THEME_LABELS, THEME_MODES
 from .config import ConfigError
@@ -32,6 +34,7 @@ from .theme import (
     LIGHT,
     Card,
     Palette,
+    Switch,
     ThemedFrame,
     ThemedLabel,
     ThemeManager,
@@ -80,6 +83,9 @@ class SettingsDialog:
         self._var_size_mb = tk.StringVar(value=str(round(config.threshold_size_bytes / MB)))
         self._var_excluded = tk.StringVar(value=", ".join(config.excluded_roots))
         self._var_theme = tk.StringVar(value=THEME_LABELS.get(config.theme, THEME_CHOICES[0]))
+        # 以**注册表实际状态**为准（而非配置值）：配置可能因崩溃残留而与实际不一致。
+        self._initial_start_on_login = self._read_start_on_login()
+        self._var_start_on_login = tk.BooleanVar(value=self._initial_start_on_login)
 
         self._theme = theme
         self._palette: Palette = theme.palette if theme is not None else LIGHT
@@ -136,6 +142,18 @@ class SettingsDialog:
             palette,
             bg="canvas",
             fg="text",
+            text="启动",
+            font=(font, 10, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(14, 0))
+
+        self._build_start_on_login_field(outer)
+
+        ThemedLabel(
+            outer,
+            palette,
+            bg="canvas",
+            fg="text",
             text="界面",
             font=(font, 10, "bold"),
             anchor="w",
@@ -183,6 +201,59 @@ class SettingsDialog:
             font=(font, 8),
             anchor="w",
         ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+    def _build_start_on_login_field(self, parent: tk.Misc) -> None:
+        """一行“开机启动 + 说明 + 开关”。
+
+        非 Windows 平台不支持（注册表 Run 键仅 Windows 有），此时开关置灰并说明原因，
+        而不是让用户点了一个注定失败的开关。
+        """
+        palette = self._palette
+        font = self._font
+        supported = autostart.IS_WINDOWS
+
+        card = Card(parent, palette, stretch=True, padding=10)
+        card.pack(fill="x", pady=(8, 0))
+        card.body.columnconfigure(0, weight=1)
+
+        ThemedLabel(
+            card.body,
+            palette,
+            bg="surface",
+            fg="text",
+            text="开机启动",
+            font=(font, 9, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        ThemedLabel(
+            card.body,
+            palette,
+            bg="surface",
+            fg="text_muted",
+            text=(
+                "登录 Windows 后在托盘静默启动（不弹窗）"
+                if supported
+                else "仅 Windows 支持开机启动"
+            ),
+            font=(font, 8),
+            anchor="w",
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        self._switch_start_on_login = Switch(
+            card.body,
+            self._var_start_on_login,
+            palette,
+            bg="surface",
+            command=None if supported else lambda: self._var_start_on_login.set(False),
+        )
+        self._switch_start_on_login.grid(
+            row=0, column=1, rowspan=2, sticky="e", padx=(10, 0)
+        )
+        if not supported:
+            self._var_start_on_login.set(False)
+            self._switch_start_on_login.configure(cursor="arrow")
 
     def _build_theme_field(self, parent: tk.Misc) -> None:
         palette = self._palette
@@ -246,6 +317,18 @@ class SettingsDialog:
     @property
     def window(self) -> tk.Toplevel:
         return self._window
+
+    def _read_start_on_login(self) -> bool:
+        """读取开机启动的**实际**状态；读取失败按未启用处理（不阻塞打开设置）。"""
+        try:
+            return bool(self._controller.is_start_on_login_enabled())
+        except Exception:  # 注册表不可读等：不影响对话框打开
+            logger.debug("读取开机启动状态失败", exc_info=True)
+            return False
+
+    def desired_start_on_login(self) -> bool:
+        """界面上选择的开机启动状态。"""
+        return bool(self._var_start_on_login.get())
 
     def collect_settings(self) -> dict[str, Any]:
         """把界面输入解析成 :meth:`AppController.apply_settings` 的关键字参数。
@@ -312,12 +395,52 @@ class SettingsDialog:
             return
 
         logger.info("设置已保存")
+
+        # 开机启动要写注册表，不能只改配置：配置改了而注册表没改，
+        # 下次启动的 sync_start_on_login() 会把它当成“残留”再改回去。
+        if not self._apply_start_on_login():
+            return  # 提示已弹出，窗口保持打开让用户重试
+
         if self._on_saved is not None:
             try:
                 self._on_saved()
             except Exception:  # pragma: no cover - 回调异常不影响保存结果
                 logger.exception("设置保存回调异常")
         self.close()
+
+    def _apply_start_on_login(self) -> bool:
+        """把界面上的开机启动选择写入注册表。
+
+        :returns: ``True`` = 已生效（含“本来就是这个状态”）；``False`` = 失败或未达预期，
+            此时已向用户提示，调用方应保持窗口打开。
+        """
+        desired = self.desired_start_on_login()
+        # 用户没动这个开关就绝不写注册表：避免“打开设置 → 保存”顺手改动启动项。
+        if desired == self._initial_start_on_login:
+            return True
+
+        try:
+            state = self._controller.set_start_on_login(desired)
+        except Exception as exc:  # 不静默
+            logger.exception("应用开机启动设置失败")
+            messagebox.showerror(SETTINGS_TITLE, f"开机启动设置失败：{exc}", parent=self._window)
+            return False
+
+        if state != desired:
+            # 注册表没写成功（权限 / 安全软件拦截等）：把开关拨回真实状态再提示。
+            self._var_start_on_login.set(state)
+            messagebox.showwarning(
+                SETTINGS_TITLE,
+                "开机启动未能{}，注册表写入可能被拦截。\n当前状态：{}".format(
+                    "启用" if desired else "关闭",
+                    "已启用" if state else "未启用",
+                ),
+                parent=self._window,
+            )
+            return False
+
+        logger.info("开机启动已%s（来自设置窗口）", "启用" if state else "关闭")
+        return True
 
     def close(self) -> None:
         if self._unregister_theme is not None:

@@ -73,7 +73,23 @@ class SingleInstance:
             return True
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = os.open(self.path, os.O_CREAT | os.O_RDWR)
+
+        # Windows 上 open 本身就可能失败，必须就地降级而不是让异常冒泡：
+        # 已有实例对该文件的字节区间加了强制锁时（msvcrt.locking 是**强制锁**，
+        # 不是劝告锁），第二个进程连打开都会被拒绝（Errno 13 Permission denied）。
+        # 实测：onefile EXE 形态下重复启动必然走到这条路径——若不拦下来，
+        # 进程会在真正提示“已在运行”之前就崩溃退出。
+        try:
+            handle = os.open(self.path, os.O_CREAT | os.O_RDWR)
+        except PermissionError:
+            logger.warning("单实例锁文件被独占（已有实例在运行）：%s", self.path)
+            return False
+        except OSError:
+            # 打不开就当作“可能被占用”，绝不冒险启动第二个实例：
+            # 双实例同时清理回收站是本工具最危险的情形。
+            logger.exception("打开单实例锁文件失败，按“已有实例”处理：%s", self.path)
+            return False
+
         if not _try_lock(handle):
             os.close(handle)
             logger.warning("单实例锁已被占用：%s", self.path)

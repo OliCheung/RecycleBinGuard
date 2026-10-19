@@ -29,6 +29,8 @@ from recyclebingguard.confirm_dialog import (
     CONFIRMATION_TITLE,
     COUNTDOWN_DONE_TEXT,
     COUNTDOWN_TEMPLATE,
+    DETAIL_TEMPLATE,
+    HEADLINE_TEXT,
     NO_COUNTDOWN_TEXT,
     SLIDE_MARGIN_X,
     SLIDE_MARGIN_Y,
@@ -638,15 +640,26 @@ def _all_texts(widget: tk.Misc) -> list[str]:
     return texts
 
 
-def test_dialog_shows_items_threshold_and_warning(root, decisions: Decisions) -> None:
+def test_dialog_stays_minimal_headline_items_and_two_buttons(
+    root, decisions: Decisions
+) -> None:
+    """界面承诺：只说“触发了清理”+ 项目数 + 倒计时，按钮只有「取消 / 清理」。
+
+    阈值、超出量、大段警告刻意**不出现**——它们属于设置窗口的职责。
+    """
     dialog = make_dialog(root, decisions)
     try:
         assert dialog._window.title() == CONFIRMATION_TITLE  # noqa: SLF001
         texts = _all_texts(dialog._window)  # noqa: SLF001
-        assert "当前回收站项目数：12,345" in texts
-        assert f"自动清理阈值：{THRESHOLD:,}" in texts
+        assert HEADLINE_TEXT in texts
+        assert DETAIL_TEMPLATE.format(items=12345) in texts  # 与 make_dialog 一致
         assert any("永久删除" in t for t in texts)
-        assert any("取消后程序会继续监控" in t for t in texts)
+        assert texts.count("取消") == 1
+        assert texts.count("清理") == 1
+        # 精简版刻意不再展示的东西（回归保护）
+        assert not any("阈值" in t for t in texts)
+        assert not any("取消后程序会继续监控" in t for t in texts)
+        assert len(texts) == 5  # 标题 / 项目数 / 倒计时 / 取消 / 清理
         assert dialog.remaining_seconds == 10
         assert decisions.count == 0  # 创建时不产生任何决定
         assert dialog.decision is None

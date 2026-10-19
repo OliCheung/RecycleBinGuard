@@ -37,6 +37,7 @@ Windows 10 回收站后台监控与自动清理工具。
 | `excluded_roots` | `[]` | 不统计、也不清空的盘符（如 `["D:\\"]`） |
 | `start_on_login` | `false` | 登录后自动启动（静默驻留托盘） |
 | `hotkey_enabled` | `true` | 全局热键 Ctrl + Alt + R 唤出状态窗口 |
+| `clean_sound_enabled` | `true` | 清理成功后播一声提示音（打包的 `assets/trash.wav`） |
 | `theme` | `"auto"` | 界面皮肤：`auto`（按系统时间自动）/ `light` / `dark` |
 
 > `dry_run` 试运行模式已移除：程序要么经你确认后真清理，要么保持只监控。
@@ -74,7 +75,8 @@ RecycleBinGuard/
 │   ├── recycle_bin_service.py # T1：回收站统计与清空核心（Shell API）
 │   ├── recycle_bin_monitor.py # T2：阈值监控与安全状态机
 │   ├── confirmation.py        # 清理前确认的请求 / 决策契约（与 UI 无关）
-│   ├── confirm_dialog.py      # 清理前确认弹窗（tkinter，10 秒倒计时，右下角升起 / 降下）
+│   ├── confirm_dialog.py      # 清理前确认弹窗（tkinter，三行小卡片，右下角升起 / 降下）
+│   ├── sound.py               # 清理音效（打包的 trash.wav，资源缺失时降级为合成波形）
 │   ├── appearance.py          # 皮肤取值与“跟随系统时间”判定（纯逻辑，不含 tkinter）
 │   ├── theme.py               # 浅色 / 深色配色、ttk 样式与自绘控件（卡片 / 开关 / 圆环）
 │   ├── single_instance.py     # T3：操作系统级单实例锁 + 唤醒已有实例
@@ -223,6 +225,7 @@ $shell = New-Object -ComObject Shell.Application; $shell.Namespace(0xA).Items().
 | `confirmation_timeout_seconds` | `10` | 确认窗倒计时秒数，`0` = 不自动 |
 | `failure_backoff_seconds` | `300` | 失败退避 |
 | `excluded_roots` | `[]` | 不统计、也不清空的盘符 |
+| `clean_sound_enabled` | `true` | 清理成功后播一声提示音，`false` 静音 |
 
 ### 触发流程
 
@@ -244,11 +247,14 @@ $shell = New-Object -ComObject Shell.Application; $shell.Namespace(0xA).Items().
 
 ### 清理前确认弹窗（`confirmation.py` + `confirm_dialog.py`）
 
+一张**小卡片**（实测 402×144），右上角三行说清一件事：_回收站已触发清理，要不要清？_
+
 | 项 | 行为 |
 | --- | --- |
 | 标题 | `RecycleBinGuard — 回收站清理确认` |
-| 内容 | 当前项目数、自动清理阈值、永久删除警告、倒计时（“10 秒后自动清空回收站”） |
-| 按钮 | 「立即清理」/「取消本次清理」；**没有默认按钮**，回车不会确认 |
+| 内容 | 只有三样：`回收站已触发清理` / `12,345 项将被永久删除` / 倒计时（`10 秒后自动清理`） |
+| 刻意不显示 | 阈值、超出量、大段风险说明——那是设置窗口与说明文档的职责，弹窗只负责让人一秒做决定 |
+| 按钮 | 「取消」/「清理」；**没有默认按钮**，回车不会确认 |
 | 关闭窗口 | 等同取消 |
 | 倒计时 | `after()` 每秒刷新 `10…1`，归零后进入复核流程（不是直接清理） |
 | 出现方式 | 像系统通知一样出现在**屏幕右下角**（避开任务栏）：从屏幕下缘**缓缓升起**到位（约 260ms） |
@@ -265,6 +271,25 @@ $shell = New-Object -ComObject Shell.Application; $shell.Namespace(0xA).Items().
 > 落位说明：弹窗要在显示前就知道自己多高，而卡片控件的高度是按内容算出来的，
 > 所以显示前会先 `sync_cards()` 同步一次尺寸（`theme.py`），避免窗口先按错误高度
 > 落位再自己收缩（看起来像“闪一下再跳过去”）。
+
+### 清理音效（`sound.py`）
+
+清理**成功或部分成功**后播一声，默认是 macOS「倒垃圾」风格的提示音（由用户提供的 MP3
+经 `tools/convert_trash_sound.py` 转成的 `assets/trash.wav`，随包分发）。
+
+| 项 | 行为 |
+| --- | --- |
+| 声音来源 | 打包的 **WAV 资源**（`recyclebingguard/assets/trash.wav`，单声道 16-bit / 44100Hz） |
+| 兜底 | 若该资源因故缺失，降级为 `render_trash_samples()` 运行时合成的波形，保证仍有声音 |
+| 播放方式 | `winsound.PlaySound(..., SND_MEMORY)`，跑在守护线程里——**清理线程一秒都不等** |
+| 失败处理 | 没有 `winsound`、非 Windows、设备被占用……一律只写一行 debug 日志，**绝不影响清理** |
+| 触发时机 | 清空 API 返回 `success` / `partial` 之后（失败不发声，避免误导） |
+| 关闭 | `config.json` 里 `clean_sound_enabled: false` |
+
+> 想换成自己的音效：把 MP3 准备好，运行 `python tools/convert_trash_sound.py "路径/音效.mp3"`
+> 即可重新生成 `assets/trash.wav`，无需改任何代码；播放链路（异步、兜底、静音开关）都不用动。
+>
+> 音频栈的首次初始化由 Windows 负责，第一次播放可能晚 0.6~0.9 秒才出声，属正常现象。
 
 ### 状态机
 
@@ -312,6 +337,11 @@ python -m pytest tests/test_recycle_bin_monitor.py tests/test_confirmation.py -q
 配置为 0 或非法值不自动清理、弹窗只用 `after()` 且不阻塞 UI，
 以及右下角落位与升降动效（升起轨迹、降下后才交付 `timeout` 决定、
 降下期间点击不改变已锁定的决定、`abort()` 立即送达、无动画模式同步交付）。
+
+`tests/test_sound.py` 覆盖清理音效：加载打包 WAV（RIFF/WAVE、16-bit 单声道、缓存复用）、
+合成兜底的波形长度与归一化、合成确定性、能量随时间衰减、静音开关、非 Windows 静默、
+同步 / 异步播放路径、播放抛异常被吞掉，以及"清理成功才响、配置关闭就不响"的接线。
+测试期间 `conftest.py` 有全局静音夹具，跑测试**不会真的发声**。
 
 ### 清理历史（记录「上一次执行清理是什么时候」）
 
@@ -364,7 +394,7 @@ Windows 10 的托盘图标经常被折叠进“隐藏的图标”区域，因此
 | --- | --- |
 | 打开状态窗口 | 默认项（左键单击也触发） |
 | 立即检查 | 派发到后台线程，UI 不冻结 |
-| 设置… | 打开设置对话框：项目数阈值 / 占用大小阈值 / 检查间隔 / 排除盘符 / 界面皮肤 |
+| 设置… | 打开设置对话框：项目数阈值 / 占用大小阈值 / 检查间隔 / 排除盘符 / **开机启动** / 界面皮肤 |
 | 皮肤：跟随系统时间（当前浅色） | 手动换肤，按 `跟随系统时间 → 浅色 → 深色` 循环，写入 `theme` |
 | 启用 / 关闭自动清理 | 关闭后再启用前弹不可逆删除风险说明并需明确确认 |
 | 打开热键（Ctrl + Alt + R） | 勾选项，对应 `hotkey_enabled` |
@@ -421,11 +451,22 @@ Windows 10 的托盘图标经常被折叠进“隐藏的图标”区域，因此
 | 占用大小阈值（MB） | `threshold_size_bytes` | `>= 0`，`0` = 不启用 |
 | 检查间隔（秒） | `poll_interval_seconds` | `>= 1` |
 | 排除的盘符 | `excluded_roots` | 逗号分隔，需形如 `D:` |
+| 开机启动 | `start_on_login` | 开关；写 `HKCU\...\Run`，仅 Windows |
 | 界面皮肤 | `theme` | 下拉选择：跟随系统时间 / 浅色 / 深色 |
 
 保存时统一走 `AppController.apply_settings()`：先整体校验，**任一项非法就整批拒绝**
 （提示且不关闭窗口），合法则就地更新共享配置、同步给服务层并原子写盘。
 新值在下一轮检查时生效（间隔从下一轮开始使用新值），无需重启。
+
+**开机启动**是唯一会写注册表的设置项，因此单独处理（`_apply_start_on_login()`）：
+
+- 开关初值取自**注册表实际状态**（而非配置值），避免显示与真实状态不一致；
+- 只有在用户**真的改了开关**时才调用 `AppController.set_start_on_login()` 写
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，没动就一个字节都不写
+  （否则“打开设置 → 保存”会顺手删掉用户已有的启动项）；
+- 写入未生效（权限 / 安全软件拦截）时把开关拨回真实状态、提示并**保持窗口打开**；
+- 非 Windows 平台开关置灰并说明原因。
+
 
 窗口顶部一行用标签明确区分：**正在监控 / 已暂停 · 自动清理已启用 / 已关闭 ·
 统计不完整 · 清理失败**（`AppController.state_labels()`，可单测）。
@@ -446,7 +487,16 @@ Windows 10 的托盘图标经常被折叠进“隐藏的图标”区域，因此
 使用操作系统级文件锁（Windows `msvcrt.locking`），不是“锁文件存在与否”判断：
 
 - 进程无论正常退出还是被强杀，操作系统都会释放锁 → **异常终止可自恢复**；
-- 重复启动时弹出提示并立即退出（退出码 3），不会创建第二个监控实例。
+- 重复启动时不再无限弹窗，而是**先唤醒已有实例**（把它的状态窗口显示出来），
+  唤醒失败才退回提示并退出（退出码 3），不会创建第二个监控实例。
+
+> **踩过的坑**：`msvcrt.locking` 是**强制锁**，不是劝告锁。已有实例锁住字节区间后，
+> 第二个进程连 `os.open(锁文件, O_CREAT | O_RDWR)` 都会被拒绝（`PermissionError` Errno 13）。
+> 早期版本这一行是裸调用，异常会一路冒泡导致**进程崩溃**（写 `crash.log`），
+> 于是根本走不到“唤醒已有实例”那一步——而这在 onefile EXE 形态下是每次重复启动必崩。
+> 现在 `acquire()` 把 PermissionError / OSError 一律当作“已有实例在运行”返回 `False`：
+> 打不开锁时宁可不启动，也绝不冒“两个实例同时清理回收站”的风险。
+> 覆盖用例见 `tests/test_single_instance.py`（含真实跨进程持锁的场景）。
 
 ### 配置持久化
 

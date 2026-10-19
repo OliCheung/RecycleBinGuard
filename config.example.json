@@ -11,6 +11,7 @@
   "excluded_roots": [],
   "start_on_login": false,
   "hotkey_enabled": true,
+  "clean_sound_enabled": true,
   "theme": "auto",
   "log_max_bytes": 1048576,
   "log_backup_count": 5

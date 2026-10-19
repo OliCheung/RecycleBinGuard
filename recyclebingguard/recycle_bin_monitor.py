@@ -44,6 +44,7 @@ from .interfaces import (
     ScanResult,
 )
 from .logging_setup import get_logger
+from .sound import play_trash_sound
 
 logger = get_logger()
 
@@ -517,6 +518,9 @@ class RecycleBinMonitor:
             # 只要真正调用了清空 API 就落一条历史（成功 / 部分 / 失败都记）。
             self._record_clean(result, trigger)
 
+            if result.outcome in (CleanOutcome.SUCCESS, CleanOutcome.PARTIAL):
+                self._play_clean_sound()
+
             if result.outcome is CleanOutcome.SUCCESS:
                 with self._lock:
                     self.clean_success_count += 1
@@ -582,6 +586,19 @@ class RecycleBinMonitor:
         records = self.history.load()
         self._last_clean_record = records[0] if records else None
         self._last_successful_record = next((r for r in records if r.succeeded), None)
+
+    def _play_clean_sound(self) -> None:
+        """清理完成后播一声提示音。
+
+        音效是**纯装饰**：任何失败都只写一行 debug 日志，绝不向上抛异常，
+        更不能影响已经完成的清理记账。配置里 ``clean_sound_enabled=false`` 时静默。
+        """
+        if not self.config.clean_sound_enabled:
+            return
+        try:
+            play_trash_sound()
+        except Exception:  # 音效失败不是错误，也不该打断监控
+            logger.debug("清理音效播放失败", exc_info=True)
 
     def _record_clean(
         self, result: CleanResult | None, trigger: str, *, error: str | None = None

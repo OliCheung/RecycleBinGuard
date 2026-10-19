@@ -129,6 +129,101 @@ def test_invalid_excluded_root_shows_error(
         dialog.close()
 
 
+# ----------------------------------------------------------------------
+# 开机启动开关
+# ----------------------------------------------------------------------
+
+
+def test_start_on_login_switch_reflects_registry_state(
+    controller: AppController, root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """开关初值取注册表实际状态，而不是配置值。"""
+    monkeypatch.setattr(controller, "is_start_on_login_enabled", lambda: True)
+
+    dialog = SettingsDialog(root, controller)
+    try:
+        assert dialog.desired_start_on_login() is True
+    finally:
+        dialog.close()
+
+
+def test_start_on_login_switch_defaults_off(
+    controller: AppController, root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(controller, "is_start_on_login_enabled", lambda: False)
+
+    dialog = SettingsDialog(root, controller)
+    try:
+        assert dialog.desired_start_on_login() is False
+    finally:
+        dialog.close()
+
+
+def test_save_enables_start_on_login(
+    controller: AppController, root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[bool] = []
+    monkeypatch.setattr(controller, "is_start_on_login_enabled", lambda: False)
+
+    def fake_set(enabled: bool) -> bool:
+        calls.append(enabled)
+        return enabled
+
+    monkeypatch.setattr(controller, "set_start_on_login", fake_set)
+
+    dialog = SettingsDialog(root, controller)
+    try:
+        dialog._var_start_on_login.set(True)  # noqa: SLF001
+        dialog.save()
+    finally:
+        dialog.close()
+
+    assert calls == [True]
+
+
+def test_save_without_touching_switch_leaves_registry_alone(
+    controller: AppController, root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只改其它设置时，绝不能连带写注册表（否则会删掉用户已有的启动项）。"""
+    calls: list[bool] = []
+    monkeypatch.setattr(controller, "is_start_on_login_enabled", lambda: True)
+    monkeypatch.setattr(
+        controller, "set_start_on_login", lambda enabled: calls.append(enabled) or enabled
+    )
+
+    dialog = SettingsDialog(root, controller)
+    try:
+        dialog._var_threshold.set("5000")  # noqa: SLF001
+        dialog.save()
+    finally:
+        dialog.close()
+
+    assert calls == []
+    assert controller.config.threshold_items == 5000
+
+
+def test_start_on_login_failure_warns_and_keeps_window(
+    controller: AppController, root: tk.Tk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(controller, "is_start_on_login_enabled", lambda: False)
+    monkeypatch.setattr(controller, "set_start_on_login", lambda enabled: False)
+    monkeypatch.setattr(
+        "recyclebingguard.settings_dialog.messagebox.showwarning",
+        lambda title, message, **kwargs: warnings.append(message),
+    )
+
+    dialog = SettingsDialog(root, controller)
+    try:
+        dialog._var_start_on_login.set(True)  # noqa: SLF001
+        dialog.save()
+        assert warnings and "开机启动" in warnings[0]
+        assert dialog.window.winfo_exists()
+        assert dialog.desired_start_on_login() is False  # 已回退到真实状态
+    finally:
+        dialog.close()
+
+
 def test_dialog_must_be_created_on_main_thread(controller: AppController, root: tk.Tk) -> None:
     errors: list[BaseException] = []
 

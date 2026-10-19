@@ -42,6 +42,8 @@ DEFAULTS: dict[str, Any] = {
     "excluded_roots": [],
     "start_on_login": False,
     "hotkey_enabled": True,
+    #: 清理完成后是否播放提示音。
+    "clean_sound_enabled": True,
     #: 界面皮肤：``auto``（按系统时间自动）/ ``light`` / ``dark``。
     "theme": "auto",
     "log_max_bytes": 1048576,
@@ -56,6 +58,7 @@ _BOOL_FIELDS = frozenset(
         "confirm_before_clean",
         "start_on_login",
         "hotkey_enabled",
+        "clean_sound_enabled",
     }
 )
 
@@ -101,6 +104,8 @@ class Config:
     start_on_login: bool = False
     #: 是否启用全局热键（Ctrl + Alt + R）唤出状态窗口。
     hotkey_enabled: bool = True
+    #: 清理完成后是否播放一声提示音（合成的“倒垃圾”音效）。
+    clean_sound_enabled: bool = True
     #: 界面皮肤：``auto``（按系统时间自动切换）/ ``light`` / ``dark``。
     theme: str = THEME_AUTO
     log_max_bytes: int = 1048576

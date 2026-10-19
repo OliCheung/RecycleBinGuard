@@ -3,7 +3,8 @@
 行为约定（与需求一致）：
 
 - 标题 ``RecycleBinGuard — 回收站清理确认``；
-- 显示当前项目数、阈值、永久删除警告与倒计时；
+- **只说必要的事**：「已触发清理」+ 项目数 + 倒计时 + 两个按钮（``取消`` / ``清理``）；
+  阈值 / 超出量 / 大段警告一律不出现（那是设置与说明文档的事）；
 - 倒计时使用 tkinter 主线程的 ``after()``，**不使用**阻塞式 ``sleep``、
   不使用 ``grab_set()`` / ``wait_window()``，因此托盘菜单与其它界面功能不会被阻塞；
 - ``confirmation_timeout_seconds > 0`` 时逐秒显示 ``10、9 … 1``，归零后进入复核；
@@ -13,9 +14,9 @@
 - ``立即清理`` / ``取消本次清理`` / 倒计时到期 / 关闭窗口之间只会产生
   **一个**最终决定（由 ``_decided`` 一次性闸门保证）。
 
-视觉与动效（本次改版）：
+视觉与动效：
 
-- 顶部红色警示卡（图标 + 永久删除说明）；环形倒计时 + 项目数 / 阈值 / 超出量对比；
+- 一张小卡片贴在工作区右下角，内容压缩到三行：标题 + 倒计时、项目数、按钮行；
 - 弹窗像系统通知一样出现在**屏幕右下角**：从屏幕下缘**升起**到位；
 - **倒计时到点**时先向下**降出**屏幕，动画播完才把 ``TIMEOUT`` 决定交给上层
   （决定在动画开始前就已锁定，因此期间点击取消 / 关闭都不会产生第二个决定）；
@@ -37,7 +38,6 @@ from .logging_setup import get_logger
 from .theme import (
     LIGHT,
     Card,
-    CountdownRing,
     Palette,
     ThemedFrame,
     ThemedLabel,
@@ -52,31 +52,27 @@ logger = get_logger()
 #: 弹窗标题。
 CONFIRMATION_TITLE = "RecycleBinGuard — 回收站清理确认"
 
-#: 倒计时提示模板（每秒刷新）。
-COUNTDOWN_TEMPLATE = "{seconds} 秒后自动清空回收站"
+#: 倒计时提示模板（每秒刷新）。刻意短，避免在右下角占宽度。
+COUNTDOWN_TEMPLATE = "{seconds} 秒后自动清理"
 
 #: 未启用倒计时时的提示。
-NO_COUNTDOWN_TEXT = "不会自动清理，等待你的操作"
+NO_COUNTDOWN_TEXT = "等待你的操作"
 
 #: 倒计时归零后的提示（随后立即进入清理前复核）。
-COUNTDOWN_DONE_TEXT = "倒计时结束，正在复核…"
+COUNTDOWN_DONE_TEXT = "倒计时结束，正在清理…"
 
-#: 永久删除警告。
-WARNING_TEXT = "警告：本次操作将清空整个 Windows 回收站，所有待恢复文件都可能被永久删除。"
+#: 主标题：只回答“发生了什么”。
+HEADLINE_TEXT = "回收站已触发清理"
 
-#: 警示卡标题。
-WARNING_TITLE = "即将清空整个 Windows 回收站"
-
-#: 取消后的行为提示。
-HINT_TEXT = "取消后程序会继续监控，下一次检查仍达到阈值时可以再次提示。"
+#: 副标题：唯一的量化信息，同时带出“不可逆”。
+DETAIL_TEMPLATE = "{items:,} 项将被永久删除"
 
 #: 倒计时步进（毫秒）。
 COUNTDOWN_TICK_MS = 1000
 
-#: 项目数 / 阈值行文案模板（测试与界面共用，避免文案漂移）。
-ITEMS_TEMPLATE = "当前回收站项目数：{items:,}"
-THRESHOLD_TEMPLATE = "自动清理阈值：{threshold:,}"
-EXCESS_TEMPLATE = "超出阈值 {excess:,} 项"
+#: 小卡片的左右/上下留白（比普通卡片更紧，弹窗才显小巧）。
+FRAME_PADDING = 12
+CARD_PADDING = 13
 
 #: 「升起 / 降下」动画参数（毫秒与像素）。
 SLIDE_DURATION_MS = 260
@@ -245,136 +241,71 @@ class CleanConfirmDialog:
     # ------------------------------------------------------------------
 
     def _build(self) -> None:
+        """三行小卡：标题 + 倒计时 / 项目数 / 按钮行。
+
+        刻意不放环形倒计时、阈值、超出量与大段警告——右下角通知的职责是
+        “让人一秒看懂并做决定”，细节交给设置窗口与状态窗口。
+        """
         palette = self._palette
         font = self._font
 
         outer = ThemedFrame(self._window, palette)
-        outer.pack(fill="both", expand=True, padx=16, pady=16)
+        outer.pack(fill="both", expand=True, padx=FRAME_PADDING, pady=FRAME_PADDING)
 
-        # -- 警示卡 --
-        banner = Card(outer, palette, fill="danger_soft", stretch=True, padding=12)
-        banner.pack(fill="x")
+        card = Card(outer, palette, stretch=True, padding=CARD_PADDING)
+        card.pack(fill="x")
+        card.body.columnconfigure(0, weight=1)
 
-        icon = ThemedLabel(
-            banner.body,
-            palette,
-            bg="danger",
-            fg="accent_text",
-            text="!",
-            font=(font, 13, "bold"),
-            width=2,
-        )
-        icon.grid(row=0, column=0, rowspan=2, sticky="n", padx=(0, 10))
-
+        # 第一行：主标题（左）+ 倒计时（右）
         ThemedLabel(
-            banner.body,
+            card.body,
             palette,
-            bg="danger_soft",
-            fg="danger_text",
-            text=WARNING_TITLE,
-            font=(font, 10, "bold"),
+            bg="surface",
+            fg="text",
+            text=HEADLINE_TEXT,
+            font=(font, 11, "bold"),
             anchor="w",
-        ).grid(row=0, column=1, sticky="w")
-
-        ThemedLabel(
-            banner.body,
-            palette,
-            bg="danger_soft",
-            fg="danger_text",
-            text=WARNING_TEXT,
-            wraplength=360,
-            justify="left",
-            anchor="w",
-            font=(font, 9),
-        ).grid(row=1, column=1, sticky="w", pady=(3, 0))
-
-        # -- 倒计时 + 数据对比 --
-        info = Card(outer, palette, stretch=True, padding=12)
-        info.pack(fill="x", pady=(12, 0))
-
-        self._ring = CountdownRing(info.body, palette, size=68)
-        self._ring.grid(row=0, column=0, rowspan=4, sticky="nw", padx=(0, 14))
+        ).grid(row=0, column=0, sticky="w")
 
         self._lbl_countdown = ThemedLabel(
-            info.body,
+            card.body,
             palette,
             bg="surface",
             fg="accent",
             text=self._countdown_text(),
-            font=(font, 11, "bold"),
-            anchor="w",
+            font=(font, 9),
+            anchor="e",
         )
-        self._lbl_countdown.grid(row=0, column=1, sticky="w")
+        self._lbl_countdown.grid(row=0, column=1, sticky="e", padx=(10, 0))
 
+        # 第二行：项目数 + 不可逆提示
         self._lbl_items = ThemedLabel(
-            info.body,
-            palette,
-            bg="surface",
-            fg="text",
-            text=ITEMS_TEMPLATE.format(items=self._request.total_items),
-            font=(font, 9),
-            anchor="w",
-        )
-        self._lbl_items.grid(row=1, column=1, sticky="w", pady=(2, 0))
-
-        self._lbl_threshold = ThemedLabel(
-            info.body,
+            card.body,
             palette,
             bg="surface",
             fg="text_muted",
-            text=THRESHOLD_TEMPLATE.format(threshold=self._request.threshold_items),
+            text=DETAIL_TEMPLATE.format(items=self._request.total_items),
             font=(font, 9),
             anchor="w",
         )
-        self._lbl_threshold.grid(row=2, column=1, sticky="w")
+        self._lbl_items.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        excess = max(0, self._request.total_items - self._request.threshold_items)
-        self._lbl_excess = ThemedLabel(
-            info.body,
-            palette,
-            bg="surface",
-            fg="danger",
-            text=EXCESS_TEMPLATE.format(excess=excess),
-            font=(font, 9, "bold"),
-            anchor="w",
-        )
-        self._lbl_excess.grid(row=3, column=1, sticky="w", pady=(2, 0))
-        info.body.columnconfigure(1, weight=1)
-
-        # -- 取消后的行为提示 --
-        ThemedLabel(
-            outer,
-            palette,
-            bg="canvas",
-            fg="text_muted",
-            text=HINT_TEXT,
-            wraplength=400,
-            justify="left",
-            anchor="w",
-            font=(font, 9),
-        ).pack(fill="x", pady=(10, 0))
-
-        # -- 按钮：立即清理为主（危险色），取消为次 --
-        buttons = ThemedFrame(outer, palette)
-        buttons.pack(fill="x", pady=(14, 0))
+        # 第三行：取消 / 清理（右对齐，不给任何默认按钮）
+        buttons = ThemedFrame(card.body, palette, bg="surface")
+        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 0))
         buttons.columnconfigure(0, weight=1)
         # 刻意不设置 default=：不存在“回车即确认”的默认行为。
-        self._btn_cancel = ttk.Button(buttons, text="取消本次清理", command=self._on_cancel)
-        self._btn_cancel.grid(row=0, column=1, sticky="e", padx=(8, 0))
+        self._btn_cancel = ttk.Button(buttons, text="取消", command=self._on_cancel)
+        self._btn_cancel.grid(row=0, column=1, sticky="e", padx=(0, 8))
         self._btn_confirm = ttk.Button(
-            buttons, text="立即清理", style="Danger.TButton", command=self._on_confirm
+            buttons, text="清理", style="Danger.TButton", command=self._on_confirm
         )
         self._btn_confirm.grid(row=0, column=2, sticky="e")
-
-        self._sync_ring()
 
     def _countdown_text(self) -> str:
         if self._remaining is None:
             return NO_COUNTDOWN_TEXT
         return COUNTDOWN_TEMPLATE.format(seconds=self._remaining)
-
-    def _sync_ring(self) -> None:
-        self._ring.set_seconds(self._remaining, self._request.timeout_seconds or None)
 
     def _apply_palette(self, palette: Palette) -> None:
         """换肤：窗口底色 + 递归刷新内部控件。"""
@@ -536,7 +467,6 @@ class CleanConfirmDialog:
 
     def _set_countdown_text(self, text: str) -> None:
         self._lbl_countdown.configure(text=text)
-        self._sync_ring()
 
     # ------------------------------------------------------------------
     # 用户动作
@@ -623,20 +553,19 @@ class CleanConfirmDialog:
 
 
 __all__ = [
+    "CARD_PADDING",
     "CONFIRMATION_TITLE",
+    "COUNTDOWN_DONE_TEXT",
     "COUNTDOWN_TEMPLATE",
-    "EXCESS_TEMPLATE",
-    "HINT_TEXT",
-    "ITEMS_TEMPLATE",
+    "DETAIL_TEMPLATE",
+    "FRAME_PADDING",
+    "HEADLINE_TEXT",
     "NO_COUNTDOWN_TEXT",
     "SLIDE_DURATION_MS",
     "SLIDE_FRAME_MS",
     "SLIDE_MARGIN_X",
     "SLIDE_MARGIN_Y",
     "SLIDE_OVERHANG",
-    "THRESHOLD_TEMPLATE",
-    "WARNING_TEXT",
-    "WARNING_TITLE",
     "CleanConfirmDialog",
     "work_area",
 ]

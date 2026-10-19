@@ -67,6 +67,19 @@ def _isolate_clean_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> P
 
 
 @pytest.fixture(autouse=True)
+def _silence_clean_sound(monkeypatch: pytest.MonkeyPatch):
+    """测试期间**不真的发音效**。
+
+    清理流程成功后会播一声提示音；不拦掉的话跑一遍全量测试会反复出声，
+    而且每条覆盖率分支都要多等一次合成。这里把监控模块里的播放函数换成假实现，
+    音效本身的逻辑交给 :mod:`tests.test_sound` 单独覆盖。
+    """
+    import recyclebingguard.recycle_bin_monitor as monitor
+
+    monkeypatch.setattr(monitor, "play_trash_sound", lambda *args, **kwargs: False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_logger():
     """每个测试后关闭并移除全局 logger 的 handler，避免句柄泄漏。"""
     yield
