@@ -162,3 +162,94 @@ def test_threshold_size_bytes_bounds() -> None:
     assert Config.from_dict({"threshold_size_bytes": 0}).threshold_size_bytes == 0
     with pytest.raises(ConfigError, match="threshold_size_bytes"):
         Config.from_dict({"threshold_size_bytes": -1})
+
+
+# --------------------------------------------------------------------------
+# v0.4.0：清理范围与垃圾判定配置
+# --------------------------------------------------------------------------
+
+
+def test_default_scope_is_vibecoding() -> None:
+    """默认必须只删垃圾，绝不默认整盘清空。"""
+    cfg = Config()
+    assert cfg.clean_scope == "vibecoding"
+    assert cfg.count_recursive is True
+    assert cfg.burst_enabled is True
+
+
+def test_scope_rejects_unknown_value() -> None:
+    with pytest.raises(ConfigError):
+        Config.from_dict({"clean_scope": "delete-everything"})
+
+
+def test_scope_accepts_both_values() -> None:
+    assert Config.from_dict({"clean_scope": "everything"}).clean_scope == "everything"
+    assert Config.from_dict({"clean_scope": "VIBECODING"}).clean_scope == "vibecoding"
+
+
+def test_pattern_lists_are_cleaned_and_deduplicated() -> None:
+    cfg = Config.from_dict(
+        {
+            "garbage_path_patterns": [r"  *\build\*  ", r"*\build\*", "", "   "],
+            "keep_path_patterns": [r"*\Desktop\*"],
+        }
+    )
+    assert cfg.garbage_path_patterns == [r"*\build\*"]
+    assert cfg.keep_path_patterns == [r"*\Desktop\*"]
+
+
+def test_pattern_lists_reject_non_strings() -> None:
+    with pytest.raises(ConfigError):
+        Config.from_dict({"garbage_path_patterns": [1, 2]})
+    with pytest.raises(ConfigError):
+        Config.from_dict({"keep_path_patterns": "not-a-list"})
+
+
+def test_burst_bounds() -> None:
+    with pytest.raises(ConfigError):
+        Config.from_dict({"burst_window_seconds": 0})
+    with pytest.raises(ConfigError):
+        Config.from_dict({"burst_min_items": 0})
+
+
+def test_count_recursive_must_be_bool() -> None:
+    with pytest.raises(ConfigError):
+        Config.from_dict({"count_recursive": 1})
+
+
+def test_old_config_without_new_keys_uses_defaults() -> None:
+    """升级兼容：v0.3.0 的配置里没有这些键，必须回落到安全默认值。"""
+    legacy = {"threshold_items": 2000, "auto_clean_enabled": True}
+    cfg = Config.from_dict(legacy)
+    assert cfg.threshold_items == 2000
+    assert cfg.clean_scope == "vibecoding"
+    assert cfg.count_recursive is True
+    assert cfg.garbage_path_patterns
+
+
+def test_discard_zone_defaults() -> None:
+    """可丢区默认只在 VibeCoding，门槛 100（宁可慢，不可误删）。"""
+    cfg = Config()
+    assert cfg.zone_enabled is True
+    assert cfg.discard_zones == [r"D:\VibeCoding"]
+    assert cfg.zone_min_items == 100
+
+
+def test_discard_zones_normalized_like_patterns() -> None:
+    cfg = Config.from_dict({"discard_zones": [r"  D:\VibeCoding  ", "", "  "]})
+    assert cfg.discard_zones == [r"D:\VibeCoding"]
+
+
+def test_zone_min_items_zero_disables() -> None:
+    assert Config.from_dict({"zone_min_items": 0}).zone_min_items == 0
+    with pytest.raises(ConfigError):
+        Config.from_dict({"zone_min_items": -1})
+
+
+def test_default_zone_does_not_cover_other_projects() -> None:
+    """默认配置下，mi4-dashboard 这类不在可丢区的项目不受影响。"""
+    from recyclebingguard.garbage_rules import matches_zone
+
+    cfg = Config()
+    assert matches_zone(r"C:\Users\OLI\mi4-dashboard\a.png", tuple(cfg.discard_zones)) is None
+    assert matches_zone(r"D:\VibeCoding\AITutor\a.png", tuple(cfg.discard_zones)) is not None

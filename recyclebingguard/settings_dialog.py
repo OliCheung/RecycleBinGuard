@@ -28,7 +28,7 @@ from typing import Any
 from . import autostart
 from .app import AppController
 from .appearance import THEME_LABELS, THEME_MODES
-from .config import ConfigError
+from .config import CLEAN_SCOPES, SCOPE_EVERYTHING, SCOPE_VIBECODING, ConfigError
 from .logging_setup import get_logger
 from .theme import (
     LIGHT,
@@ -52,6 +52,17 @@ MB = 1024 * 1024
 
 #: 皮肤下拉框：界面文案列表（顺序与 :data:`~recyclebingguard.appearance.THEME_MODES` 一致）。
 THEME_CHOICES = tuple(THEME_LABELS[mode] for mode in THEME_MODES)
+
+#: 设置窗口最大高度占屏幕高度的比例（超出部分滚动查看）。
+MAX_SCREEN_FRACTION = 0.85
+
+#: 清理范围下拉框文案 <-> 配置值。
+SCOPE_LABELS: dict[str, str] = {
+    SCOPE_VIBECODING: "只删 vibecoding 垃圾（推荐）",
+    SCOPE_EVERYTHING: "清空整个回收站",
+}
+#: 文案列表（顺序与 :data:`~recyclebingguard.config.CLEAN_SCOPES` 一致）。
+SCOPE_CHOICES = tuple(SCOPE_LABELS[mode] for mode in CLEAN_SCOPES)
 
 
 class SettingsDialog:
@@ -83,6 +94,11 @@ class SettingsDialog:
         self._var_size_mb = tk.StringVar(value=str(round(config.threshold_size_bytes / MB)))
         self._var_excluded = tk.StringVar(value=", ".join(config.excluded_roots))
         self._var_theme = tk.StringVar(value=THEME_LABELS.get(config.theme, THEME_CHOICES[0]))
+        self._var_scope = tk.StringVar(value=SCOPE_LABELS.get(config.clean_scope, SCOPE_CHOICES[0]))
+        self._initial_patterns = "\n".join(config.garbage_path_patterns)
+        self._initial_keep = "\n".join(config.keep_path_patterns)
+        self._initial_zones = "\n".join(config.discard_zones)
+        self._var_zone_min = tk.StringVar(value=str(config.zone_min_items))
         # 以**注册表实际状态**为准（而非配置值）：配置可能因崩溃残留而与实际不一致。
         self._initial_start_on_login = self._read_start_on_login()
         self._var_start_on_login = tk.BooleanVar(value=self._initial_start_on_login)
@@ -115,8 +131,43 @@ class SettingsDialog:
         palette = self._palette
         font = self._font
 
-        outer = ThemedFrame(self._window, palette)
-        outer.pack(fill="both", expand=True, padx=16, pady=16)
+        # 设置项变多后可能高过屏幕（1024×768 或缩放 150% 时尤其明显），
+        # 因此把内容放进可滚动画布：窗口自适应屏幕高度，超出部分滚动查看。
+        shell = ThemedFrame(self._window, palette)
+        shell.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(
+            shell,
+            bg=palette.canvas,
+            highlightthickness=0,
+            bd=0,
+        )
+        scrollbar = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        outer = ThemedFrame(canvas, palette)
+        window_id = canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def on_outer_configure(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        outer.bind("<Configure>", on_outer_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        def on_wheel(event) -> None:
+            # 只在确实需要滚动时才吃滚轮事件，短窗口保持原生日志区行为。
+            first, last = canvas.yview()
+            if first <= 0.0 and last >= 1.0:
+                return
+            canvas.yview_scroll(-1 * (event.delta // 120), "units")
+
+        canvas.bind_all("<MouseWheel>", on_wheel)
+        outer.pack_configure(padx=16, pady=16)
 
         ThemedLabel(
             outer,
@@ -136,6 +187,20 @@ class SettingsDialog:
         )
         for title, variable, hint in rows:
             self._build_field(outer, title, variable, hint)
+
+        ThemedLabel(
+            outer,
+            palette,
+            bg="canvas",
+            fg="text",
+            text="清理范围与垃圾判定",
+            font=(font, 10, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(14, 0))
+
+        self._build_scope_field(outer)
+        self._build_zone_field(outer)
+        self._build_patterns_field(outer)
 
         ThemedLabel(
             outer,
@@ -202,6 +267,171 @@ class SettingsDialog:
             anchor="w",
         ).grid(row=2, column=0, sticky="w", pady=(4, 0))
 
+    def _build_zone_field(self, parent: tk.Misc) -> None:
+        """可丢区：一行一个目录前缀 + 清理门槛。
+
+        判的是「删除前位于哪个目录」，不关心文件类型 —— 放在这些目录里的项目
+        无论是一次性的还是长期更新的，删进回收站够多就一起清。
+        """
+        palette = self._palette
+        font = self._font
+
+        card = Card(parent, palette, stretch=True, padding=10)
+        card.pack(fill="x", pady=(8, 0))
+        card.body.columnconfigure(0, weight=1)
+
+        ThemedLabel(
+            card.body,
+            palette,
+            bg="surface",
+            fg="text",
+            text="可丢区目录（按位置判定，不看文件类型）",
+            font=(font, 9, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        box = tk.Text(
+            card.body,
+            height=3,
+            wrap="none",
+            font=("Consolas", 8),
+            bg=palette.code,
+            fg=palette.code_text,
+            insertbackground=palette.code_text,
+            highlightthickness=0,
+            bd=0,
+        )
+        box.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        box.insert("1.0", self._initial_zones)
+        self._text_zones = box
+
+        threshold = ThemedFrame(card.body, palette, bg="surface")
+        threshold.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        threshold.columnconfigure(0, weight=1)
+        ThemedLabel(
+            threshold,
+            palette,
+            bg="surface",
+            fg="text_muted",
+            text="累计多少项后清理",
+            font=(font, 8),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        tk.Entry(
+            threshold,
+            textvariable=self._var_zone_min,
+            width=8,
+            justify="right",
+            font=(font, 9),
+        ).grid(row=0, column=1, sticky="e")
+
+        ThemedLabel(
+            card.body,
+            palette,
+            bg="surface",
+            fg="text_muted",
+            text="一行一个目录，如 D:\\VibeCoding；累计够门槛就整批清理，0 = 关闭",
+            font=(font, 8),
+            anchor="w",
+        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+
+    def _build_scope_field(self, parent: tk.Misc) -> None:
+        """清理范围下拉框：只删垃圾 / 整盘清空。"""
+        palette = self._palette
+        font = self._font
+        card = Card(parent, palette, stretch=True, padding=10)
+        card.pack(fill="x", pady=(8, 0))
+        card.body.columnconfigure(0, weight=1)
+
+        ThemedLabel(
+            card.body,
+            palette,
+            bg="surface",
+            fg="text",
+            text="清理范围",
+            font=(font, 9, "bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+
+        self._combo_scope = ttk.Combobox(
+            card.body,
+            textvariable=self._var_scope,
+            values=list(SCOPE_CHOICES),
+            state="readonly",
+            width=28,
+        )
+        self._combo_scope.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
+        ThemedLabel(
+            card.body,
+            palette,
+            bg="surface",
+            fg="text_muted",
+            text="只删垃圾：命中路径规则或时间突发的条目才会被删，其余永久保留",
+            font=(font, 8),
+            anchor="w",
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
+    def _build_patterns_field(self, parent: tk.Misc) -> None:
+        """垃圾 / 保留两个路径规则文本框（一行一条 glob）。"""
+        palette = self._palette
+        font = self._font
+
+        for title, initial, hint in (
+            (
+                "判定为垃圾的路径",
+                self._initial_patterns,
+                "一行一条 glob，大小写不敏感，作用于删除前的原始路径",
+            ),
+            (
+                "永不清理的路径（优先级最高）",
+                self._initial_keep,
+                "命中这里的条目一律保留，例如桌面 / 文档 / 下载",
+            ),
+        ):
+            card = Card(parent, palette, stretch=True, padding=10)
+            card.pack(fill="x", pady=(8, 0))
+            card.body.columnconfigure(0, weight=1)
+
+            ThemedLabel(
+                card.body,
+                palette,
+                bg="surface",
+                fg="text",
+                text=title,
+                font=(font, 9, "bold"),
+                anchor="w",
+            ).grid(row=0, column=0, sticky="w")
+
+            box = tk.Text(
+                card.body,
+                height=4,
+                wrap="none",
+                font=("Consolas", 8),
+                bg=palette.code,
+                fg=palette.code_text,
+                insertbackground=palette.code_text,
+                highlightthickness=0,
+                bd=0,
+            )
+            box.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+            box.insert("1.0", initial)
+            # 保存时再从控件里读回内容（Text 不像 Entry 那样能双向绑定变量）。
+            if title.startswith("判定为垃圾"):
+                self._text_patterns = box
+            else:
+                self._text_keep = box
+
+            ThemedLabel(
+                card.body,
+                palette,
+                bg="surface",
+                fg="text_muted",
+                text=hint,
+                font=(font, 8),
+                anchor="w",
+            ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+
     def _build_start_on_login_field(self, parent: tk.Misc) -> None:
         """一行“开机启动 + 说明 + 开关”。
 
@@ -248,9 +478,7 @@ class SettingsDialog:
             bg="surface",
             command=None if supported else lambda: self._var_start_on_login.set(False),
         )
-        self._switch_start_on_login.grid(
-            row=0, column=1, rowspan=2, sticky="e", padx=(10, 0)
-        )
+        self._switch_start_on_login.grid(row=0, column=1, rowspan=2, sticky="e", padx=(10, 0))
         if not supported:
             self._var_start_on_login.set(False)
             self._switch_start_on_login.configure(cursor="arrow")
@@ -292,13 +520,20 @@ class SettingsDialog:
         ).grid(row=2, column=0, sticky="w", pady=(4, 0))
 
     def _center(self) -> None:
+        """居中并对窗口高度封顶，超出部分由内部画布滚动。
+
+        不封顶的话，设置项一多窗口就会高过屏幕（实测 1536px），
+        底部按钮会被挤出可见区域。
+        """
         try:
             self._window.update_idletasks()
             width = self._window.winfo_reqwidth()
             height = self._window.winfo_reqheight()
+            max_height = int(self._window.winfo_screenheight() * MAX_SCREEN_FRACTION)
+            height = min(height, max_height)
             x = max(0, (self._window.winfo_screenwidth() - width) // 2)
             y = max(0, (self._window.winfo_screenheight() - height) // 3)
-            self._window.geometry(f"+{x}+{y}")
+            self._window.geometry(f"{width}x{height}+{x}+{y}")
         except tk.TclError:  # pragma: no cover - 无显示器等极端情况
             logger.debug("对话框居中失败", exc_info=True)
 
@@ -345,7 +580,32 @@ class SettingsDialog:
             "threshold_size_bytes": size_mb * MB,
             "excluded_roots": excluded,
             "theme": self._parse_theme(self._var_theme.get()),
+            "clean_scope": self._parse_scope(self._var_scope.get()),
+            "garbage_path_patterns": self._parse_patterns(self._text_patterns.get("1.0", "end")),
+            "keep_path_patterns": self._parse_patterns(self._text_keep.get("1.0", "end")),
+            "discard_zones": self._parse_patterns(self._text_zones.get("1.0", "end")),
+            "zone_min_items": self._parse_int(
+                self._var_zone_min.get(), "可丢区清理门槛", minimum=0
+            ),
         }
+
+    @staticmethod
+    def _parse_scope(text: str) -> str:
+        """把下拉框文案翻译成配置值（未知文案保持默认的只删垃圾）。"""
+        cleaned = text.strip()
+        for mode, label in SCOPE_LABELS.items():
+            if label == cleaned:
+                return mode
+        return cleaned.lower() if cleaned.lower() in CLEAN_SCOPES else SCOPE_VIBECODING
+
+    @staticmethod
+    def _parse_patterns(raw: str) -> list[str]:
+        """一行一条 glob；忽略空行与 ``#`` 开头的注释行。"""
+        return [
+            line.strip()
+            for line in raw.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
 
     @staticmethod
     def _parse_int(raw: str, label: str, *, minimum: int) -> int:
@@ -446,6 +706,11 @@ class SettingsDialog:
         if self._unregister_theme is not None:
             self._unregister_theme()
             self._unregister_theme = None
+        # 滚轮绑定用的是 bind_all，必须解绑，否则窗口关掉后仍会拦截全局滚轮。
+        try:
+            self._window.unbind_all("<MouseWheel>")
+        except tk.TclError:  # pragma: no cover - 窗口可能已销毁
+            pass
         try:
             self._window.destroy()
         except tk.TclError:  # pragma: no cover - 窗口可能已销毁

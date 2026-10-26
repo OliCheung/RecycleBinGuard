@@ -74,7 +74,7 @@ class AppController:
         self.config_path = Path(config_path) if config_path else paths.config_path()
         self.log_path = Path(log_path) if log_path else paths.log_file_path()
 
-        self.service = service if service is not None else RecycleBinService()
+        self.service = service if service is not None else self._build_service(config)
         self.monitor = monitor if monitor is not None else RecycleBinMonitor(self.service, config)
         if self.monitor.config is not config:
             raise ValueError("monitor 必须与控制器共享同一个 Config 对象")
@@ -96,6 +96,22 @@ class AppController:
 
         # 监控器通过控制器向 UI 提交确认请求：这是“后台线程 -> UI 主线程”的唯一入口。
         self.monitor.set_confirmation_requester(self)
+
+    @staticmethod
+    def _build_service(config: Config) -> RecycleBinService:
+        """按 ``clean_scope`` 选择服务实现。
+
+        - ``vibecoding``（默认）：``ScopedRecycleBinService``，只删判定为垃圾的条目；
+        - ``everything``：T1 的整盘清空实现，行为与 v0.3.0 完全一致。
+        """
+        from .config import SCOPE_EVERYTHING
+
+        base = RecycleBinService()
+        if config.clean_scope == SCOPE_EVERYTHING:
+            return base
+        from .scoped_service import ScopedRecycleBinService
+
+        return ScopedRecycleBinService(config, fallback=base)  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -239,6 +255,78 @@ class AppController:
         if success is None:
             return f"{record.describe()}（从未成功清理过）"
         return f"{record.describe()}（上次成功：{success.format_time()}）"
+
+    # -- 清理预览（只读，不删除任何东西）--
+
+    def preview_clean(self, *, limit: int = 200) -> tuple[str, list[str], str]:
+        """生成「这次会清理什么、会保留什么」的只读预览。
+
+        返回 ``(标题, 文本行, 页脚)``，可直接交给托盘文本窗口展示。
+        索引 + 分类可能遍历上万条记录，调用方应放在后台线程执行。
+        """
+        from .clean_preview import build_preview
+        from .garbage_rules import RecycleReason
+
+        preview = build_preview(self.config)
+        summary = preview.summary
+
+        lines: list[str] = []
+        lines.append(f"清理范围模式：{self.config.clean_scope}")
+        counted_by = "递归文件数" if self.config.count_recursive else "顶层条目数"
+        lines.append(f"阈值口径：{counted_by}  阈值={self.config.threshold_items:,}")
+        lines.append("")
+        lines.append(f"回收站顶层条目：{summary.total_items:,}（无法读取 {summary.opaque_items}）")
+        lines.append(f"递归文件条目数：{summary.total_entries:,}")
+        lines.append(
+            f"判定为垃圾    ：{summary.garbage_items:,} 项 / {summary.garbage_entries:,} 个文件"
+        )
+        lines.append(f"将会保留      ：{summary.keep_items:,} 项 / {summary.keep_entries:,} 个文件")
+        if summary.zone_waiting_items:
+            remaining = max(0, self.config.zone_min_items - summary.zone_waiting_items)
+            lines.append(
+                f"  可丢区待触发：{summary.zone_waiting_items:,} 项"
+                f"（门槛 {self.config.zone_min_items:,}，还差 {remaining:,} 项）"
+            )
+        if self.config.discard_zones:
+            lines.append(f"  可丢区目录  ：{', '.join(self.config.discard_zones)}")
+        lines.append(
+            f"阈值计数      ：{preview.counted_entries(self.config):,} / "
+            f"{self.config.threshold_items:,}"
+            f"    {'已触发清理条件' if preview.should_trigger(self.config) else '未达阈值'}"
+        )
+        if not preview.index.is_complete:
+            lines.append(
+                f"索引不完整    ：失败磁盘 {list(preview.index.failed_roots)}（此时不清理）"
+            )
+        lines.append("")
+
+        reasons = preview.reason_counts()
+        lines.append("判定原因分布：")
+        for reason in RecycleReason:
+            count = reasons.get(reason)
+            if count:
+                lines.append(f"  {reason.value:<16} {count:,}")
+        lines.append("")
+
+        lines.append(f"将被清理的条目（最多 {limit} 条，按大小降序）：")
+        garbage = preview.examples(limit=limit)
+        for path, reason, pattern in garbage:
+            suffix = f"（命中 {pattern}）" if pattern else f"（{reason.value}）"
+            lines.append(f"  {path} {suffix}")
+        if not garbage:
+            lines.append("  （没有条目被判定为垃圾）")
+
+        lines.append("")
+        lines.append(f"将被保留的条目（最多 {limit} 条）：")
+        kept = preview.examples(limit=limit, garbage=False)
+        for path, reason, pattern in kept:
+            suffix = f"（命中 {pattern}）" if pattern else f"（{reason.value}）"
+            lines.append(f"  {path} {suffix}")
+        if not kept:
+            lines.append("  （没有需要保留的条目）")
+
+        footer = "本窗口只做判定预览，不会删除任何东西。"
+        return "预览清理范围", lines, footer
 
     def recent_logs(self, limit: int = 200) -> list[str]:
         """读取最近若干行日志（不记录文件内容，只回显日志行）。

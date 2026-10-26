@@ -19,11 +19,22 @@ from typing import Any
 
 from . import paths
 from .appearance import THEME_AUTO, THEME_MODES
+from .garbage_patterns import (
+    DEFAULT_DISCARD_ZONES,
+    DEFAULT_GARBAGE_PATTERNS,
+    DEFAULT_KEEP_PATTERNS,
+)
 from .interfaces import normalize_root
 
 
 class ConfigError(ValueError):
     """配置内容非法（字段缺失、类型错误、取值越界或 JSON 解析失败）。"""
+
+
+#: ``clean_scope`` 的两种取值。
+SCOPE_VIBECODING = "vibecoding"
+SCOPE_EVERYTHING = "everything"
+CLEAN_SCOPES: tuple[str, ...] = (SCOPE_VIBECODING, SCOPE_EVERYTHING)
 
 
 #: 默认安全配置值，PRD 第 11 节。
@@ -48,6 +59,28 @@ DEFAULTS: dict[str, Any] = {
     "theme": "auto",
     "log_max_bytes": 1048576,
     "log_backup_count": 5,
+    # ---- 清理范围与垃圾判定（v0.4.0 起）----
+    #: 清理范围：``vibecoding`` 只清判定为垃圾的条目并保留其余；``everything`` 整盘清空。
+    "clean_scope": SCOPE_VIBECODING,
+    #: 阈值按递归条目数（文件 + 目录）计算，而不是回收站顶层条目数。
+    "count_recursive": True,
+    #: 判定为垃圾的原始路径 glob 模式（大小写不敏感）。
+    "garbage_path_patterns": list(DEFAULT_GARBAGE_PATTERNS),
+    #: 永不清理的原始路径 glob 模式，优先级最高。
+    "keep_path_patterns": list(DEFAULT_KEEP_PATTERNS),
+    #: 是否启用「时间突发」判定。
+    "burst_enabled": True,
+    #: 突发判定的时间窗口（秒）。
+    "burst_window_seconds": 300,
+    #: 窗口内集中删除多少个**顶层条目**才算突发。
+    "burst_min_items": 50,
+    #: 「可丢区」目录前缀：位于这些目录下的条目累计够多就整批评为垃圾。
+    "discard_zones": list(DEFAULT_DISCARD_ZONES),
+    #: 可丢区的清理门槛（顶层条目数）。默认 100：宁可慢一点，也不要因为
+    #: 某次性清理删掉几十个文件就误触发整批删除。
+    "zone_min_items": 100,
+    #: 是否启用可丢区规则。
+    "zone_enabled": True,
 }
 
 _BOOL_FIELDS = frozenset(
@@ -59,13 +92,22 @@ _BOOL_FIELDS = frozenset(
         "start_on_login",
         "hotkey_enabled",
         "clean_sound_enabled",
+        "count_recursive",
+        "burst_enabled",
+        "zone_enabled",
     }
 )
 
 #: 字符串枚举字段 -> 合法取值（顺序即界面切换顺序）。
 _STR_CHOICES: dict[str, tuple[str, ...]] = {
     "theme": THEME_MODES,
+    "clean_scope": CLEAN_SCOPES,
 }
+
+#: 字符串数组字段（每一项都必须是字符串）。
+_STR_LIST_FIELDS = frozenset(
+    {"excluded_roots", "garbage_path_patterns", "keep_path_patterns", "discard_zones"}
+)
 
 #: 字段 -> (最小值, 最大值)，最大值 None 表示不设上限。
 _INT_BOUNDS: dict[str, tuple[int, int | None]] = {
@@ -78,6 +120,11 @@ _INT_BOUNDS: dict[str, tuple[int, int | None]] = {
     "failure_backoff_seconds": (0, None),
     "log_max_bytes": (1024, None),
     "log_backup_count": (0, None),
+    #: 突发判定：窗口至少 1 秒；最少条目至少 1 个（1 表示任何删除都算突发，慎用）。
+    "burst_window_seconds": (1, None),
+    "burst_min_items": (1, None),
+    #: 可丢区门槛：0 = 关闭（任何条目都不按可丢区清理）。
+    "zone_min_items": (0, None),
 }
 
 
@@ -110,6 +157,27 @@ class Config:
     theme: str = THEME_AUTO
     log_max_bytes: int = 1048576
     log_backup_count: int = 5
+    #: 清理范围：``vibecoding``（只删垃圾，默认）/ ``everything``（整盘清空）。
+    clean_scope: str = SCOPE_VIBECODING
+    #: 阈值是否按递归条目数（文件 + 子目录）计算。
+    count_recursive: bool = True
+    #: 判定为垃圾的原始路径 glob 模式。
+    garbage_path_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_GARBAGE_PATTERNS))
+    #: 永不清理的原始路径 glob 模式（优先级最高）。
+    keep_path_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_KEEP_PATTERNS))
+    #: 是否启用「时间突发」判定。
+    burst_enabled: bool = True
+    #: 突发判定的时间窗口（秒）。
+    burst_window_seconds: int = 300
+    #: 窗口内集中删除多少个顶层条目才算突发。
+    burst_min_items: int = 50
+    #: 「可丢区」目录前缀（如 ``D:\\VibeCoding``）：这些目录下删进回收站的条目，
+    #: 累计够多就整批清理，不要求文件本身具有垃圾特征。
+    discard_zones: list[str] = field(default_factory=lambda: list(DEFAULT_DISCARD_ZONES))
+    #: 可丢区的清理门槛（顶层条目数）；0 = 关闭。
+    zone_min_items: int = 100
+    #: 是否启用可丢区规则。
+    zone_enabled: bool = True
 
     def __post_init__(self) -> None:
         # 容错：把 "d:" / "D:/" 统一成 "D:\\"（非法项原样保留，交给 validate 报错）。
@@ -162,6 +230,7 @@ class Config:
                 raise ConfigError(f"{name} 不能大于 {high}，实际为 {value}")
         self._validate_choices()
         self._validate_excluded_roots()
+        self._validate_pattern_lists()
 
     def _validate_choices(self) -> None:
         for name, choices in _STR_CHOICES.items():
@@ -186,6 +255,24 @@ class Config:
                 normalized.append(root)
         self.excluded_roots = normalized
 
+    def _validate_pattern_lists(self) -> None:
+        """校验 glob 模式列表：必须是字符串数组，去空白项并去重（保序）。
+
+        空模式在匹配时本就会被跳过，这里顺手剔除，避免配置里留下无意义的空行。
+        """
+        for name in ("garbage_path_patterns", "keep_path_patterns", "discard_zones"):
+            value = getattr(self, name)
+            if not isinstance(value, list):
+                raise ConfigError(f"{name} 必须是字符串数组，实际为 {type(value).__name__}")
+            cleaned: list[str] = []
+            for item in value:
+                if not isinstance(item, str):
+                    raise ConfigError(f"{name} 的每一项都必须是字符串，实际为 {item!r}")
+                text = item.strip()
+                if text and text not in cleaned:
+                    cleaned.append(text)
+            setattr(self, name, cleaned)
+
 
 def _coerce(key: str, value: Any) -> Any:
     """把 JSON 读入的原始值转成期望类型，失败时抛出 :class:`ConfigError`。"""
@@ -203,9 +290,9 @@ def _coerce(key: str, value: Any) -> Any:
             raise ConfigError(f"{key} 必须是 {allowed} 之一，实际为 {value!r}")
         return candidate
 
-    if key == "excluded_roots":
+    if key in _STR_LIST_FIELDS:
         if not isinstance(value, list):
-            raise ConfigError(f"excluded_roots 必须是字符串数组，实际为 {value!r}")
+            raise ConfigError(f"{key} 必须是字符串数组，实际为 {value!r}")
         return value
 
     if isinstance(value, bool) or not isinstance(value, int):

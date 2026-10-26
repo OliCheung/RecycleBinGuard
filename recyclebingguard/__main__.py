@@ -51,7 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--check-once",
         action="store_true",
-        help="只做一次统计后退出（不启动托盘，也不清空任何东西）",
+        help="只做一次统计与清理预览后退出（不启动托盘，也不清空任何东西）",
+    )
+    parser.add_argument(
+        "--examples",
+        action="store_true",
+        help="配合 --check-once：额外列出将被清理的示例路径",
     )
     parser.add_argument(
         "--console-log",
@@ -163,7 +168,9 @@ def _warn_already_running() -> None:
         print(f"[{APP_NAME}] {message}", file=sys.stderr)
 
 
-def _run_check_once(emit: Emit) -> int:
+def _run_check_once(emit: Emit, config: Config, *, show_examples: bool = False) -> int:
+    from .clean_preview import build_preview
+    from .garbage_rules import RecycleReason
     from .recycle_bin_service import RecycleBinService
 
     result = RecycleBinService().scan()
@@ -179,6 +186,43 @@ def _run_check_once(emit: Emit) -> int:
         emit(f"  失败磁盘   : {list(result.failed_roots)}")
     if result.error:
         emit(f"  扫描错误   : {result.error}")
+
+    preview = build_preview(config)
+    summary = preview.summary
+    emit("")
+    emit(f"清理预览（只读，不删除任何东西）  模式={config.clean_scope}")
+    emit(f"  回收站顶层条目 : {summary.total_items}（其中不透明 {summary.opaque_items}）")
+    emit(f"  递归文件条目数 : {summary.total_entries}")
+    emit(f"  判定为垃圾     : {summary.garbage_items} 项 / {summary.garbage_entries} 个文件")
+    emit(f"  将会保留       : {summary.keep_items} 项 / {summary.keep_entries} 个文件")
+    if summary.zone_waiting_items:
+        remaining = max(0, config.zone_min_items - summary.zone_waiting_items)
+        emit(
+            f"  可丢区待触发   : {summary.zone_waiting_items} 项"
+            f"（门槛 {config.zone_min_items}，还差 {remaining} 项）"
+        )
+    if config.discard_zones:
+        emit(f"  可丢区目录     : {', '.join(config.discard_zones)}")
+    emit(f"  阈值口径计数   : {preview.counted_entries(config)} / {config.threshold_items}")
+    emit(f"  会触发清理     : {preview.should_trigger(config)}")
+    if not preview.index.is_complete:
+        emit(f"  索引不完整     : 失败磁盘={list(preview.index.failed_roots)}")
+
+    reasons = preview.reason_counts()
+    if reasons:
+        emit("  判定原因分布   :")
+        for reason in RecycleReason:
+            count = reasons.get(reason)
+            if count:
+                emit(f"    {reason.value:<16} {count}")
+
+    if show_examples:
+        examples = preview.examples(limit=30)
+        if examples:
+            emit("  将被清理的示例 :")
+            for path, reason, pattern in examples:
+                suffix = f"（命中 {pattern}）" if pattern else f"（{reason.value}）"
+                emit(f"    {path} {suffix}")
     return EXIT_OK
 
 
@@ -383,7 +427,7 @@ def _dispatch(args: argparse.Namespace, emit: Emit) -> int:
         return EXIT_OK
 
     if args.check_once:
-        return _run_check_once(emit)
+        return _run_check_once(emit, config, show_examples=args.examples)
 
     instance = SingleInstance()
     if not instance.acquire():

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 __all__ = ["__version__", "APP_NAME"]
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
 #: 应用名，用于数据目录、日志与启动项命名。
 APP_NAME = "RecycleBinGuard"

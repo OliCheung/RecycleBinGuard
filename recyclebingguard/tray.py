@@ -436,6 +436,8 @@ class TrayApplication:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("安装开始菜单 / 桌面快捷方式", self._menu_install_shortcuts),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("预览清理范围", self._menu_preview_clean),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("查看最近清理日志", self._menu_show_logs),
             pystray.MenuItem("查看清理历史", self._menu_show_clean_history),
             pystray.Menu.SEPARATOR,
@@ -758,6 +760,9 @@ class TrayApplication:
     def _menu_install_shortcuts(self, icon=None, item=None) -> None:
         self._post(self._on_install_shortcuts)
 
+    def _menu_preview_clean(self, icon=None, item=None) -> None:
+        self._post(self._show_clean_preview)
+
     def _menu_show_logs(self, icon=None, item=None) -> None:
         self._post(self._show_logs)
 
@@ -969,17 +974,47 @@ class TrayApplication:
             messagebox.showerror(APP_NAME, f"切换开机启动失败：{exc}", parent=self._root)
         self._refresh()
 
-    def _open_text_window(self, title: str, lines: list[str], footer: str) -> None:
-        """打开一个只读文本窗口（日志 / 清理历史共用）。
+    def _open_text_window(
+        self,
+        title: str,
+        lines: list[str],
+        footer: str,
+        *,
+        reuse: tk.Toplevel | None = None,
+    ) -> tk.Toplevel:
+        """打开一个只读文本窗口（日志 / 清理历史 / 预览共用）。
 
         刻意**不**调用 ``transient(self._root)``：托盘常驻时主窗口是隐藏的，
         transient 会让子窗口跟着隐藏，用户点了菜单却看不到内容。
+
+        :param reuse: 复用一个已存在的窗口（原地替换标题与内容）。预览这类
+            “先开占位窗口、后台算完再填内容”的场景必须复用它，否则会多出
+            一个关不掉的「正在生成预览…」窗口。
+        :returns: 创建的（或被复用的）窗口，便于调用方后续原地更新。
         """
+        if reuse is not None:
+            try:
+                self._fill_text_window(reuse, title, lines, footer)
+                return reuse
+            except tk.TclError:  # 窗口已被用户关掉：退回新建
+                logger.debug("复用的文本窗口已销毁，改为新建", exc_info=True)
+
         palette = self._theme.palette
         window = tk.Toplevel(self._root)
-        window.title(f"{APP_NAME} — {title}")
         window.geometry("760x420")
         window.configure(bg=palette.canvas)
+        self._fill_text_window(window, title, lines, footer)
+        window.lift()
+        return window
+
+    def _fill_text_window(
+        self, window: tk.Toplevel, title: str, lines: list[str], footer: str
+    ) -> None:
+        """（重新）填充文本窗口内容；可在窗口已存在时反复调用。"""
+        palette = self._theme.palette
+        window.title(f"{APP_NAME} — {title}")
+        for child in window.winfo_children():
+            child.destroy()
 
         text = scrolledtext.ScrolledText(
             window,
@@ -1013,6 +1048,31 @@ class TrayApplication:
             self._controller.recent_logs(limit=200),
             str(self._controller.log_path),
         )
+
+    def _show_clean_preview(self) -> None:
+        """预览清理范围：只统计，不删除任何东西。
+
+        索引与分类都要遍历回收站目录，放在后台线程跑，避免卡住界面；
+        结果回到主线程再用文本窗口展示。
+        """
+        placeholder = self._open_text_window(
+            "正在生成预览…", ["正在读取回收站索引与判定垃圾条目，请稍候…"], ""
+        )
+
+        def work() -> None:
+            try:
+                preview = self._controller.preview_clean(limit=200)
+            except Exception as exc:  # 不静默
+                logger.exception("生成清理预览失败")
+                # 先算好文本再投递：except 结束后 ``exc`` 会被删除，lambda 里直接引用会 NameError。
+                text = f"生成预览失败：{exc!r}"
+                self._post(
+                    lambda: self._open_text_window("预览清理范围", [text], "", reuse=placeholder)
+                )
+                return
+            self._post(lambda: self._open_text_window(*preview, reuse=placeholder))
+
+        threading.Thread(target=work, name="RBG-Preview", daemon=True).start()
 
     def _show_clean_history(self) -> None:
         """清理历史：什么时候清空过、清理前后各多少、结果如何。"""
