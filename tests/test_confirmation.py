@@ -640,9 +640,7 @@ def _all_texts(widget: tk.Misc) -> list[str]:
     return texts
 
 
-def test_dialog_stays_minimal_headline_items_and_two_buttons(
-    root, decisions: Decisions
-) -> None:
+def test_dialog_stays_minimal_headline_items_and_two_buttons(root, decisions: Decisions) -> None:
     """界面承诺：只说“触发了清理”+ 项目数 + 倒计时，按钮只有「取消 / 清理」。
 
     阈值、超出量、大段警告刻意**不出现**——它们属于设置窗口的职责。

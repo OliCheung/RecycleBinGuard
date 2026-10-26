@@ -109,16 +109,12 @@ def render_trash_samples(
         envelope = attack * math.exp(-4.6 * progress)
 
         # ① 低频冲击：频率指数下滑的 sine
-        frequency = _THUMP_END_HZ + (_THUMP_START_HZ - _THUMP_END_HZ) * math.exp(
-            -7.0 * progress
-        )
+        frequency = _THUMP_END_HZ + (_THUMP_START_HZ - _THUMP_END_HZ) * math.exp(-7.0 * progress)
         phase += 2.0 * math.pi * frequency / rate
         thump = math.sin(phase)
 
         # ② 气流：白噪声过一阶低通，截止频率同步下滑
-        cutoff = _CUTOFF_END_HZ + (_CUTOFF_START_HZ - _CUTOFF_END_HZ) * math.exp(
-            -9.0 * progress
-        )
+        cutoff = _CUTOFF_END_HZ + (_CUTOFF_START_HZ - _CUTOFF_END_HZ) * math.exp(-9.0 * progress)
         alpha = 1.0 - math.exp(-2.0 * math.pi * min(cutoff, rate * 0.45) / rate)
         lowpass += alpha * (rng.uniform(-1.0, 1.0) - lowpass)
 
@@ -192,9 +188,7 @@ def play_trash_sound(*, enabled: bool = True, wait: bool = False) -> bool:
     if wait:
         return _play_sync(data)
 
-    threading.Thread(
-        target=_play_sync, args=(data,), name="RBG-TrashSound", daemon=True
-    ).start()
+    threading.Thread(target=_play_sync, args=(data,), name="RBG-TrashSound", daemon=True).start()
     return True
 
 
