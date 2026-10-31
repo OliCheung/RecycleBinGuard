@@ -335,7 +335,30 @@ def test_zone_disabled_keeps_everything() -> None:
 def test_zone_summary_counts_waiting_items() -> None:
     summary = summarize(classify_entries(_zone_entries(3), _zone_config()))
     assert summary.zone_waiting_items == 3
+    assert summary.zone_waiting_entries == 3
     assert summary.garbage_items == 0
+
+
+def test_zone_single_large_folder_triggers_by_recursive_entries() -> None:
+    """删除一个含上万文件的整项目文件夹（只有 1 条顶层记录）也算够门槛。"""
+    folder = entry(r"D:\VibeCoding\Stellora", recursive=20000)
+    classified = classify_entries([folder], _zone_config(zone_min_items=5))
+    assert classified[0].reason is RecycleReason.GARBAGE_ZONE
+
+
+def test_zone_below_both_thresholds_stays_waiting() -> None:
+    folder = entry(r"D:\VibeCoding\Stellora", recursive=4)
+    classified = classify_entries([folder], _zone_config(zone_min_items=5))
+    assert classified[0].reason is RecycleReason.KEEP_ZONE_WAITING
+
+
+def test_zone_many_medium_folders_trigger_by_recursive_entries() -> None:
+    """10 个各含 2000 文件的文件夹 = 10 条顶层记录，但递归数足以触发。"""
+    folders = [
+        entry(rf"D:\VibeCoding\project{index}", recursive=2000) for index in range(10)
+    ]
+    classified = classify_entries(folders, _zone_config(zone_min_items=100))
+    assert all(item.reason is RecycleReason.GARBAGE_ZONE for item in classified)
 
 
 def test_zone_takes_precedence_over_burst() -> None:

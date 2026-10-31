@@ -5,9 +5,15 @@
 1. **保留白名单**：原始路径命中即永不清理（桌面 / 文档 / 下载等）；
 2. **不透明项**：无法读取原路径的条目一律保留（别人的回收站、损坏的 ``$I``）；
 3. **路径特征**：原始路径命中临时目录 / 依赖目录 / 构建产物等模式；
-4. **时间突发**：同一时间窗口内集中删除的大量条目 —— vibecoding 的典型特征
+4. **可丢区**：原始路径位于用户指定的可丢区目录（默认 ``D:\\VibeCoding``），
+   且累计够多（**顶层条目数或递归文件数任一达到门槛**）→ 整批评为垃圾；
+5. **时间突发**：同一时间窗口内集中删除的大量条目 —— vibecoding 的典型特征
    （一次构建 / 一次会话吐出成百上千个零散文件）；
-5. 以上都不命中 → **保留**（默认不删，宁可漏删不可误删）。
+6. 以上都不命中 → **保留**（默认不删，宁可漏删不可误删）。
+
+第 4 条为什么同时看递归文件数：用户删除一个整项目文件夹时，回收站里只有
+**1 条**顶层记录，但里面可能有上万文件。若只按顶层条目数算门槛，这种最常见
+的「整个项目丢进回收站」永远不会被判定为垃圾，阈值也就永远触发不了。
 
 为什么时间突发按**顶层条目数**判定：用户手动删一个装 500 张照片的文件夹，
 在回收站里只会产生 **1 条**记录（实测验证），不会被误判成突发；而一次构建
@@ -135,8 +141,9 @@ class ClassifyConfig:
     #: 「可丢区」前缀：删除前位于这些目录下的条目，只要累计够多就整批评为垃圾。
     #: 判的是**位置**而不是文件特征，因此不受项目内文件类型影响。
     discard_zones: tuple[str, ...] = DEFAULT_DISCARD_ZONES
-    #: 可丢区条目的清理门槛（**顶层条目数**，不是递归文件数）。
+    #: 可丢区条目的清理门槛。**顶层条目数**或**递归文件条目数**任一达到即触发。
     #: 刻意与 ``burst_min_items`` 分开：这个门槛越低，清理越积极。
+    #: 递归口径保证「删掉一个含上万文件的整项目文件夹」也能被识别（那只是 1 条记录）。
     zone_min_items: int = 100
     #: 是否启用可丢区规则。
     zone_enabled: bool = True
@@ -192,6 +199,7 @@ def classify_entries(
 
     # ---- 可丢区：按位置整批判定（在突发规则之前，优先级更高）----
     zone_positions: list[int] = []
+    zone_entries = 0
     if config.zone_enabled and config.zone_min_items > 0 and items:
         for index, (entry, classified) in enumerate(zip(items, results, strict=True)):
             # 白名单 / 不透明 / 解析失败一律不动；路径规则已经判为垃圾的也无需再看
@@ -201,9 +209,12 @@ def classify_entries(
             if zone is None:
                 continue
             zone_positions.append(index)
+            zone_entries += entry.recursive_entries
             results[index] = ClassifiedEntry(entry, RecycleReason.KEEP_ZONE_WAITING, zone)
         # 够门槛就整批评为垃圾：判的是「这些是从可丢区删的」，与文件类型无关。
-        if len(zone_positions) >= config.zone_min_items:
+        # 顶层条目数与递归条目数**任一**达到门槛即可：删掉一个含上万文件的整项目
+        # 文件夹在回收站里只是 1 条记录（顶层数=1），但递归数可能远超门槛。
+        if len(zone_positions) >= config.zone_min_items or zone_entries >= config.zone_min_items:
             for index in zone_positions:
                 results[index] = ClassifiedEntry(
                     items[index], RecycleReason.GARBAGE_ZONE, results[index].pattern
@@ -244,14 +255,16 @@ class ClassifySummary:
     opaque_items: int = 0
     total_entries: int = 0
     total_items: int = 0
-    #: 位于可丢区但尚未达到门槛的条目数（对外单独展示，便于理解「还差多少」）。
+    #: 位于可丢区但尚未达到门槛的**顶层条目数**（对外单独展示，便于理解「还差多少」）。
     zone_waiting_items: int = 0
+    #: 上述待触发条目的**递归文件条目数**（与顶层数任一达到门槛即触发）。
+    zone_waiting_entries: int = 0
 
 
 def summarize(classified: list[ClassifiedEntry]) -> ClassifySummary:
     """把分类结果汇总成便于展示的数字。"""
     garbage_entries = garbage_items = keep_entries = keep_items = opaque = 0
-    zone_waiting = 0
+    zone_waiting = zone_waiting_entries = 0
     for item in classified:
         entry = item.entry
         if item.is_garbage:
@@ -264,6 +277,7 @@ def summarize(classified: list[ClassifiedEntry]) -> ClassifySummary:
             keep_entries += entry.recursive_entries
             if item.reason is RecycleReason.KEEP_ZONE_WAITING:
                 zone_waiting += 1
+                zone_waiting_entries += entry.recursive_entries
     return ClassifySummary(
         garbage_entries=garbage_entries,
         garbage_items=garbage_items,
@@ -273,6 +287,7 @@ def summarize(classified: list[ClassifiedEntry]) -> ClassifySummary:
         total_entries=garbage_entries + keep_entries,
         total_items=garbage_items + keep_items + opaque,
         zone_waiting_items=zone_waiting,
+        zone_waiting_entries=zone_waiting_entries,
     )
 
 

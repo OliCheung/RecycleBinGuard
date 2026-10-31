@@ -196,10 +196,17 @@ def _run_check_once(emit: Emit, config: Config, *, show_examples: bool = False) 
     emit(f"  判定为垃圾     : {summary.garbage_items} 项 / {summary.garbage_entries} 个文件")
     emit(f"  将会保留       : {summary.keep_items} 项 / {summary.keep_entries} 个文件")
     if summary.zone_waiting_items:
-        remaining = max(0, config.zone_min_items - summary.zone_waiting_items)
+        remaining = max(
+            0,
+            min(
+                config.zone_min_items - summary.zone_waiting_items,
+                config.zone_min_items - summary.zone_waiting_entries,
+            ),
+        )
         emit(
-            f"  可丢区待触发   : {summary.zone_waiting_items} 项"
-            f"（门槛 {config.zone_min_items}，还差 {remaining} 项）"
+            f"  可丢区待触发   : {summary.zone_waiting_items} 项 / "
+            f"{summary.zone_waiting_entries} 个文件"
+            f"（门槛 {config.zone_min_items}，还差 {remaining}）"
         )
     if config.discard_zones:
         emit(f"  可丢区目录     : {', '.join(config.discard_zones)}")

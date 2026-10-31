@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "recyclebingguard"
-version = "0.4.0"
+version = "0.4.1"
 description = "Windows 10 回收站后台监控与自动清理工具"
 requires-python = ">=3.11"
 readme = "README.md"

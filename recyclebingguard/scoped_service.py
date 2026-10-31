@@ -160,10 +160,16 @@ class ScopedRecycleBinService:
             queried_at=started,
             disks=disks,
             error=None,
+            # 参考值：回收站里实际有多少内容（含保留项），供 UI 展示与排查
+            # 「有几万项却没触发清理」的疑惑。
+            reference_items=summary.total_items,
+            reference_entries=summary.total_entries,
         )
         logger.info(
-            "回收站统计（只删垃圾模式）：垃圾条目=%d 垃圾文件数=%d 保留=%d 不透明=%d "
-            "阈值口径计数=%d 失败磁盘=%s",
+            "回收站统计（只删垃圾模式）：实际条目=%d 实际文件数=%d "
+            "垃圾条目=%d 垃圾文件数=%d 保留=%d 不透明=%d 阈值口径计数=%d 失败磁盘=%s",
+            summary.total_items,
+            summary.total_entries,
             summary.garbage_items,
             summary.garbage_entries,
             summary.keep_items,

@@ -107,6 +107,12 @@ class ScanResult:
     queried_at: datetime = field(default_factory=datetime.now)
     disks: tuple[DiskScanResult, ...] = ()
     error: str | None = None
+    #: **参考值**：回收站里实际索引到的顶层条目数（含保留 / 不透明项）。
+    #: ``total_items`` 是「阈值口径」（只删垃圾模式下只有垃圾被计数），
+    #: UI 需要同时展示两者，用户才能理解「回收站明明有两万项，为什么没触发」。
+    reference_items: int | None = None
+    #: **参考值**：回收站里实际索引到的递归条目数（文件 + 目录，含保留项）。
+    reference_entries: int | None = None
 
     @property
     def is_complete(self) -> bool:

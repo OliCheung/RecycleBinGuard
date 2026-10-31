@@ -248,6 +248,56 @@ def test_autostart_row_is_cached_not_polled(
 
 
 # --------------------------------------------------------------------------
+# 状态展示：实际条目 vs 可清理垃圾
+# --------------------------------------------------------------------------
+
+
+def test_hero_shows_reference_total_not_garbage_count(
+    tray: TrayApplication, controller: AppController
+) -> None:
+    controller.monitor.last_scan = ScanResult(
+        total_items=3,
+        total_size_bytes=0,
+        scanned_roots=("C:\\",),
+        reference_items=20000,
+        reference_entries=25000,
+    )
+
+    tray._refresh()  # noqa: SLF001
+
+    assert tray._hero.count_label.cget("text") == "20,000"  # noqa: SLF001
+    caption = tray._hero.caption_label.cget("text")  # noqa: SLF001
+    assert "可清理 3" in caption
+
+
+def test_advises_once_when_bin_is_full_but_nothing_cleanable(
+    tray: TrayApplication, controller: AppController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller.config.threshold_items = 100
+    controller.monitor.last_scan = ScanResult(
+        total_items=3,
+        total_size_bytes=0,
+        scanned_roots=("C:\\",),
+        reference_items=20000,
+    )
+    notified: list[tuple[str, str]] = []
+
+    def fake_notify(title: str, message: str) -> bool:
+        notified.append((title, message))
+        return True
+
+    monkeypatch.setattr(tray, "_notify", fake_notify)
+
+    status = controller.status()
+    tray._notify_changes(status)  # noqa: SLF001
+    tray._notify_changes(status)  # noqa: SLF001
+
+    assert len(notified) == 1
+    assert "20,000" in notified[0][1]
+    assert "可丢区" in notified[0][1]
+
+
+# --------------------------------------------------------------------------
 # 线程安全投递
 # --------------------------------------------------------------------------
 

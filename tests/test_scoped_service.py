@@ -104,6 +104,24 @@ def test_scan_counts_only_garbage_recursively() -> None:
     assert result.scanned_roots == ("C:\\",)
 
 
+def test_scan_exposes_reference_totals() -> None:
+    """阈值口径只算垃圾，但参考值必须给出回收站里实际有多少内容。"""
+    store = FakeStore(
+        [
+            entry(r"C:\proj\build\out.apk", recursive=500),
+            entry(r"C:\Users\me\Desktop\photo.jpg", recursive=1),
+            entry(r"C:\Users\me\notes\a.docx", recursive=3),
+        ]
+    )
+    service = make_service(make_config(), store)
+
+    result = service.scan()
+
+    assert result.total_items == 500  # 阈值口径：仅垃圾
+    assert result.reference_items == 3  # 实际顶层条目
+    assert result.reference_entries == 504  # 实际递归条目（500 + 1 + 3）
+
+
 def test_scan_top_level_when_recursive_disabled() -> None:
     store = FakeStore([entry(r"C:\proj\build\out.apk", recursive=500)])
     service = make_service(make_config(count_recursive=False), store)

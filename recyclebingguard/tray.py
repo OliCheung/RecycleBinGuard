@@ -190,6 +190,8 @@ class TrayApplication:
 
         self._last_error_seen: str | None = None
         self._last_clean_seen: object = None
+        #: 是否已提示过「回收站内容很多、但可清理垃圾不足阈值」（每次越线只提示一次）。
+        self._advised_no_garbage = False
         self._last_icon_color: str | None = None
         self._tick_count = 0
         self._autostart_cached = False
@@ -293,6 +295,7 @@ class TrayApplication:
         for index, (key, title) in enumerate(
             (
                 ("threshold", "触发阈值"),
+                ("cleanable", "可清理垃圾"),
                 ("last_check", "最近检查"),
                 ("next_check", "下次检查"),
                 ("last_clean", "最近清理结果"),
@@ -626,17 +629,46 @@ class TrayApplication:
         status = self._controller.status()
         scan = status.last_scan
 
-        # 英雄卡：状态徽标 + 大字号项目数 + 距阈值进度
-        count_text = f"{scan.total_items:,}" if scan is not None else "—"
+        # 英雄卡：状态徽标 + 大字号项目数 + 距阈值进度。
+        #
+        # 大数字必须显示**回收站实际条目数**（reference_items），而不是阈值口径的
+        # 垃圾计数：只删垃圾模式下二者可能相差几万，显示后者会让用户误以为程序
+        # 没看见自己删掉的文件。进度条仍按「可清理垃圾 / 阈值」推进，才与触发
+        # 清理的真实条件一致。
         threshold_items = max(1, self._controller.config.threshold_items)
-        ratio = (scan.total_items / threshold_items) if scan is not None else 0.0
+        if scan is None:
+            count_text = "—"
+            caption = f"回收站条目 / 触发阈值 {threshold_items:,}"
+            ratio = 0.0
+        else:
+            total_items = (
+                scan.reference_items if scan.reference_items is not None else scan.total_items
+            )
+            count_text = f"{total_items:,}"
+            if scan.reference_items is None:
+                caption = f"回收站条目 / 触发阈值 {threshold_items:,}"
+            else:
+                caption = (
+                    f"回收站条目 {total_items:,} · 可清理 {scan.total_items:,}"
+                    f" / 触发阈值 {threshold_items:,}"
+                )
+            ratio = scan.total_items / threshold_items
         self._hero.set_values(
             state_text=self._controller.state_summary(status),
             count_text=count_text,
-            caption=f"回收站项目总数 / 触发阈值 {threshold_items:,}",
+            caption=caption,
             ratio=ratio,
         )
         self._set_row("threshold", f"{threshold_items:,}", tone="text")
+        self._set_row(
+            "cleanable",
+            (
+                "—"
+                if scan is None
+                else f"{scan.total_items:,}（达到 {threshold_items:,} 才触发）"
+            ),
+            tone="warn" if scan is not None and scan.total_items > 0 else "text_muted",
+        )
 
         last_check = _format_time(scan.queried_at) if scan is not None else "尚未检查"
         incomplete = scan is not None and not scan.is_complete
@@ -712,6 +744,8 @@ class TrayApplication:
 
     def _notify_changes(self, status) -> None:
         """错误与清理结果通过托盘气泡通知，不静默。"""
+        self._advise_when_nothing_cleanable(status)
+
         if status.last_error and status.last_error != self._last_error_seen:
             self._last_error_seen = status.last_error
             self._notify("清理或检查出现问题", status.last_error)
@@ -727,13 +761,47 @@ class TrayApplication:
             if outcome.succeeded:
                 self._notify("回收站已清空", f"清理了 {outcome.items_before} 个项目")
 
-    def _notify(self, title: str, message: str) -> None:
-        if not self._icon_ready.is_set() or self._icon is None:
+    def _advise_when_nothing_cleanable(self, status) -> None:
+        """回收站实际内容已过阈值、但可清理垃圾不足时，提示一次原因。
+
+        典型的「明明删了两万个文件，程序却毫无反应」场景：这些文件要么位于
+        保留白名单 / 可丢区之外，要么是整块删除的文件夹而当前规则未覆盖。
+        程序仍**不会**删除它们（安全优先），但必须让用户知道为什么没动静，
+        并指出可以调整的地方。
+        """
+        scan = status.last_scan
+        if scan is None or scan.reference_items is None:
             return
+        threshold = max(1, self._controller.config.threshold_items)
+        over_total = scan.reference_items >= threshold
+        not_enough_garbage = scan.total_items < threshold
+        should_advise = over_total and not_enough_garbage
+
+        if not should_advise:
+            self._advised_no_garbage = False
+            return
+        if self._advised_no_garbage:
+            return
+        # 只有真正送达才记「已提示」：托盘图标尚未就绪时 _notify 会返回 False，
+        # 下一轮刷新还要再试，否则这条提示会被永久吞掉。
+        if self._notify(
+            "回收站已有很多项目，但可自动清理的不够",
+            f"回收站现有 {scan.reference_items:,} 项，其中判定为可清理垃圾的"
+            f"只有 {scan.total_items:,} 项（阈值 {threshold:,}）。"
+            "可在「设置…」里把项目目录加入可丢区，或把清理范围改为整盘清空。",
+        ):
+            self._advised_no_garbage = True
+
+    def _notify(self, title: str, message: str) -> bool:
+        """弹托盘气泡；返回是否真正送达（图标未就绪 / 后端不支持时为 ``False``）。"""
+        if not self._icon_ready.is_set() or self._icon is None:
+            return False
         try:
             self._icon.notify(message, title)
+            return True
         except Exception:  # pragma: no cover - 某些后端不支持气泡通知
             logger.debug("托盘通知失败", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # 托盘菜单回调（运行在 pystray 线程）

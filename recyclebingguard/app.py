@@ -282,10 +282,17 @@ class AppController:
         )
         lines.append(f"将会保留      ：{summary.keep_items:,} 项 / {summary.keep_entries:,} 个文件")
         if summary.zone_waiting_items:
-            remaining = max(0, self.config.zone_min_items - summary.zone_waiting_items)
+            remaining = max(
+                0,
+                min(
+                    self.config.zone_min_items - summary.zone_waiting_items,
+                    self.config.zone_min_items - summary.zone_waiting_entries,
+                ),
+            )
             lines.append(
-                f"  可丢区待触发：{summary.zone_waiting_items:,} 项"
-                f"（门槛 {self.config.zone_min_items:,}，还差 {remaining:,} 项）"
+                f"  可丢区待触发：{summary.zone_waiting_items:,} 项 / "
+                f"{summary.zone_waiting_entries:,} 个文件"
+                f"（门槛 {self.config.zone_min_items:,}，还差 {remaining:,}）"
             )
         if self.config.discard_zones:
             lines.append(f"  可丢区目录  ：{', '.join(self.config.discard_zones)}")
